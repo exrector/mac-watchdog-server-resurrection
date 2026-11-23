@@ -30,7 +30,16 @@ _ts=$(date '+%Y-%m-%d %H:%M:%S')
 _wifi=$(networksetup -getairportpower "${WIFI_INTERFACE:-en1}" 2>/dev/null | grep -o "On\|Off" | head -1)
 _ip=$(ipconfig getifaddr "${WIFI_INTERFACE:-en1}" 2>/dev/null)
 _gw=$(route -n get default 2>/dev/null | awk '/gateway:/{print $2}')
-_dns=$(networksetup -getdnsservers Wi-Fi 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+# DNS servers. networksetup prints "There aren't any DNS Servers set
+# on Wi-Fi." when the servers come from DHCP — that sentence is useless
+# in the log, so in that case read the actual resolvers from scutil.
+_dns_raw=$(networksetup -getdnsservers Wi-Fi 2>/dev/null)
+if echo "$_dns_raw" | grep -qi "aren't any"; then
+  _dns=$(scutil --dns 2>/dev/null | awk '/nameserver\[[0-9]+\]/{print $3}' | sort -u | tr '\n' ',' | sed 's/,$//')
+  _dns=${_dns:-DHCP}
+else
+  _dns=$(echo "$_dns_raw" | tr '\n' ',' | sed 's/,$//')
+fi
 _ts_state="no-tailscale"
 if [ -n "${TAILSCALE_HOSTNAME:-}" ]; then
   _ts_state=$("${TAILSCALE_CLI:-/Applications/Tailscale.app/Contents/MacOS/Tailscale}" status 2>/dev/null | head -1 | tr -s ' ' | cut -d' ' -f1-2)

@@ -185,6 +185,21 @@ verify_item() {
   return 0
 }
 
+# Verify an item with a settle grace period. After a reflex, a service
+# (e.g. Tailscale) takes a moment to come up; a single immediate check
+# can report BROKEN even though the tool worked, and that false failure
+# would unfairly lower the tool's score. Retry up to 3 times with a
+# 2-second pause, and only declare failure if it is still broken after
+# the grace period.
+verify_item_settle() {
+  local item="$1" attempt
+  for attempt in 1 2 3; do
+    if verify_item "$item"; then return 0; fi
+    if [ "$attempt" -lt 3 ]; then sleep 2; fi
+  done
+  return 1
+}
+
 # Deterministic health verification. Sets BROKEN_ITEMS to an array of
 # broken item names (empty when healthy). Returns 0 only if all enabled
 # checks are OK.
@@ -271,6 +286,7 @@ reflex_tailscale() {
 run_reflexes() {
   REFLEX_LOG=""
   REFLEX_TS_KIND=""
+  RAN_TOOLS=""
   local start end secs item tool_id ok
   for item in "${BROKEN_ITEMS[@]}"; do
     case "$item" in
@@ -303,12 +319,16 @@ run_reflexes() {
         if [ "$item" = "tailscale" ] && [ "$REFLEX_TS_KIND" = "login" ]; then tool_id="tailscale-login"; fi
         end=$(date +%s)
         secs=$((end - start))
-        if verify_item "$item"; then
+        # Verify with a settle grace period: the service needs a moment
+        # to come up after the reflex, and a single immediate check can
+        # falsely report failure.
+        if verify_item_settle "$item"; then
           ok=1
         else
           ok=0
         fi
         record_tool_run "$tool_id" "$ok" "$secs" "$item"
+        RAN_TOOLS="$RAN_TOOLS $tool_id"
         echo "$(date '+%Y-%m-%d %H:%M:%S') $tool_id symptoms=$SYMPTOMS secs=$secs success=$ok" >> "$ATTEMPTS"
         echo "TOOL $tool_id: success=$ok, ${secs}s" >> "$LOG"
         ;;
@@ -670,7 +690,7 @@ call_analyst() {
   # their states — this is the model's job: it judges which tools work
   # and ranks them. The controller applies the proposal (with a minimum
   # evidence bound) and records the facts.
-  apply_tool_evals "$out"
+  apply_tool_evals "$out" "$RAN_TOOLS"
   # Record the incident: facts from the script + the model's analysis.
   {
     echo "=== $(date '+%Y-%m-%d %H:%M:%S') INCIDENT ==="
@@ -678,7 +698,7 @@ call_analyst() {
     echo "REFLEXES: ${REFLEX_LOG:-none}"
     echo "OUTCOME: $outcome"
     echo "$verified_out" | grep -A 20 "^ANSWER=" | sed 's/^/ANALYSIS: /'
-    echo "$verified_out" | grep "^HYPOTHESIS:" | sed 's/^/CAUSE: /'
+    echo "$verified_out" | grep "^HYPOTHESIS:" | head -1 | sed -E 's/(REFUTES: (none|H[0-9]+)).*/\1/' | sed 's/^/CAUSE: /'
   } >> "$INCIDENTS"
   echo "INCIDENT recorded in $INCIDENTS" >> "$LOG"
 }
@@ -712,11 +732,11 @@ fi
 if [ "${1:-}" = "--test-analyst" ]; then
   SYMPTOMS="${2:-dns}"
   case "$SYMPTOMS" in
-    *tailscale*) REFLEX_LOG="tailscale-up (test)" ;;
-    *dns*) REFLEX_LOG="dns-reset (test)" ;;
-    *wifi*) REFLEX_LOG="wifi-on (test)" ;;
-    *route*) REFLEX_LOG="route-add (test)" ;;
-    *) REFLEX_LOG="none (test)" ;;
+    *tailscale*) REFLEX_LOG="tailscale-up (test)"; RAN_TOOLS="tailscale-up" ;;
+    *dns*) REFLEX_LOG="dns-reset (test)"; RAN_TOOLS="dns-reset" ;;
+    *wifi*) REFLEX_LOG="wifi-on (test)"; RAN_TOOLS="wifi-on" ;;
+    *route*) REFLEX_LOG="route-add (test)"; RAN_TOOLS="route-add" ;;
+    *) REFLEX_LOG="none (test)"; RAN_TOOLS="" ;;
   esac
   echo "TEST-ANALYST: invoking the analyst on prepared data (symptoms=$SYMPTOMS, outcome=${3:-FIXED-BY-REFLEX})" >> "$LOG"
   call_analyst "${3:-FIXED-BY-REFLEX}" "$SYMPTOMS"

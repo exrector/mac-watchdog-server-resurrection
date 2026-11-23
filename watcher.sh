@@ -456,6 +456,27 @@ if [ "${1:-}" = "--dry-run" ]; then
   fi
 fi
 
+# Test mode: invoke the analyst on prepared data, without touching the
+# network. Reads the prepared incident history, events and hypothesis
+# table from the watchdog dir and calls the analyst with a synthetic
+# incident. Usage: watcher.sh --test-analyst [symptoms] [outcome]
+#   symptoms: e.g. "dns" (default: "dns")
+#   outcome: FIXED-BY-REFLEX | FIXED-BY-MODEL | GAVE-UP (default: FIXED-BY-REFLEX)
+# The analyst runs in read-only `ask` mode and cannot repair anything,
+# so this is safe to run on a healthy machine. Prepare the data first:
+# write a past incident to incidents.log, pre-incident state lines to
+# events.log, and a hypothesis to hypotheses.tsv — then the analyst
+# should spot the pattern (or refute the hypothesis) and record its
+# conclusion in incidents.log and hypotheses.tsv.
+if [ "${1:-}" = "--test-analyst" ]; then
+  SYMPTOMS="${2:-dns}"
+  REFLEX_LOG="dns-reset (test)"
+  echo "TEST-ANALYST: invoking the analyst on prepared data (symptoms=$SYMPTOMS, outcome=${3:-FIXED-BY-REFLEX})" >> "$LOG"
+  call_analyst "${3:-FIXED-BY-REFLEX}" "$SYMPTOMS"
+  echo "TEST-ANALYST: done. See incidents.log and hypotheses.tsv." >> "$LOG"
+  exit 0
+fi
+
 # 1. Pre-check: if the machine is already healthy, do nothing. The model
 # is not woken on a healthy machine.
 if verify_health; then

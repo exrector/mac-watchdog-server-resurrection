@@ -374,6 +374,52 @@ run_reflexes() {
         RAN_TOOLS="$RAN_TOOLS $tool_id"
         echo "$(date '+%Y-%m-%d %H:%M:%S') $tool_id symptoms=$SYMPTOMS secs=$secs success=$ok" >> "$ATTEMPTS"
         echo "TOOL $tool_id: success=$ok, ${secs}s" >> "$LOG"
+        if [ "$ok" -eq 0 ]; then
+          # Last attempt (admission): the admitted tool failed. Now a
+          # candidate tool gets its chance — best first, at most two
+          # per item per run. A candidate is new and unproven, so it
+          # only runs when every admitted tool for this symptom failed.
+          # Its run is recorded like any other, and it counts only if
+          # independent verification (verify_item_settle) confirms the
+          # symptom is actually fixed. A candidate that fixes the
+          # symptom earns a success and can later be promoted by the
+          # model's evaluation (capped by the controller's evidence
+          # thresholds); one that fails stays a candidate and is tried
+          # again next time — still only as a last attempt. This is how
+          # a new tool enters the library: proposed in idle time by the
+          # reviewer (see review.sh), admitted here by its own results.
+          _tried=0
+          for _cand in $(select_candidate_for_symptom "$item" 2>/dev/null); do
+            [ "$_tried" -ge 2 ] && break
+            if ! tool_is_implemented "$_cand"; then
+              echo "LAST-ATTEMPT $item: $_cand has no implementation, skipping" >> "$LOG"
+              continue
+            fi
+            echo "LAST-ATTEMPT $item -> $_cand (candidate; admitted tools failed)" >> "$LOG"
+            start=$(date +%s)
+            case "$_cand" in
+              wifi-on) reflex_wifi ;;
+              dns-reset) reflex_dns ;;
+              route-add) reflex_route ;;
+              tailscale-up|tailscale-login) reflex_tailscale ;;
+              *) if [ -x "$WATCHDOG_DIR/tools/$_cand.sh" ]; then
+                   "$WATCHDOG_DIR/tools/$_cand.sh" >> "$LOG" 2>&1
+                 else
+                   echo "TOOL $_cand: no implementation, skipping" >> "$LOG"; continue
+                 fi ;;
+            esac
+            if [ "$item" = "tailscale" ] && [ "$REFLEX_TS_KIND" = "login" ]; then _cand="tailscale-login"; fi
+            end=$(date +%s)
+            secs=$((end - start))
+            if verify_item_settle "$item"; then ok=1; else ok=0; fi
+            record_tool_run "$_cand" "$ok" "$secs" "$item"
+            RAN_TOOLS="$RAN_TOOLS $_cand"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') $_cand symptoms=$SYMPTOMS secs=$secs success=$ok" >> "$ATTEMPTS"
+            echo "LAST-ATTEMPT $_cand: success=$ok, ${secs}s" >> "$LOG"
+            _tried=$((_tried + 1))
+            [ "$ok" -eq 1 ] && break
+          done
+        fi
         ;;
       ping) echo "REFLEX ping: no direct reflex (ping is a symptom, not a cause — the other reflexes address it)" >> "$LOG" ;;
     esac
@@ -395,9 +441,11 @@ run_reflexes() {
 # which one is preferred.
 # Two safety gates (audit fixes):
 #   - candidate tools are NOT listed: a candidate is created, not yet
-#     admitted. It must pass independent admission checks before it
-#     runs on a live failure — an untested tool must never beat a
-#     proven one in real repair.
+#     admitted. It runs only as a last attempt, after every admitted
+#     tool for the symptom failed (see run_reflexes and
+#     select_candidate_for_symptom) — an untested tool must never beat
+#     a proven one in real repair, but it must get its chance to earn
+#     evidence, or it could never be admitted at all.
 #   - the caller must check that a listed tool is actually implemented
 #     (tool_is_implemented) and fall back to the next one if it is not.
 #     A high-scored tool with no implementation must not block the
@@ -417,6 +465,33 @@ select_tool_for_symptom() {
       w = ($3 == "preferred") ? 3 : 2
       avg = ($4 > 0) ? $6 / $4 : 0
       score = rate * 100 + w
+      printf "%.4f\t%.4f\t%s\n", score, avg, $1
+    }
+  ' "$TOOLS" 2>/dev/null | sort -t "$(printf '\t')" -k1,1nr -k2,2n | cut -f3
+}
+
+# select_candidate_for_symptom: the same ranking, candidates only.
+# A candidate is a new tool proposed by the reviewer in idle time (see
+# review.sh). It is NOT in the normal selection — it only runs as a
+# last attempt, after every admitted tool for the symptom failed (see
+# run_reflexes). All candidates carry the same state, so no state weight
+# is added: the smoothed success rate and the average time decide.
+# A new candidate starts at a neutral 0.5 and is ordered with the
+# others by the same evidence as admitted tools.
+select_candidate_for_symptom() {
+  local sym="$1"
+  [ -f "$TOOLS" ] || return 1
+  awk -F'\t' -v sym="$sym" '
+    NR==1 { next }
+    $3 != "candidate" { next }
+    {
+      n = split($7, types, ",")
+      found = 0
+      for (i = 1; i <= n; i++) if (types[i] == sym) found = 1
+      if (!found) next
+      rate = ($5 + 1) / ($4 + 2)
+      avg = ($4 > 0) ? $6 / $4 : 0
+      score = rate * 100
       printf "%.4f\t%.4f\t%s\n", score, avg, $1
     }
   ' "$TOOLS" 2>/dev/null | sort -t "$(printf '\t')" -k1,1nr -k2,2n | cut -f3

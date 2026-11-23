@@ -90,9 +90,13 @@ largest risk surface in this project — a mistaken command can change
 settings or damage files. Scope it to the machine's purpose and keep the
 machine's own access controls in mind.
 
-A future version should restrict the model to a fixed set of repair
-operations (diagnose freely, execute only from an allow-list, with
-argument checking on privileged commands). That is not implemented yet.
+There is deliberately no command whitelist and no human in the loop.
+The model works from the standard macOS tools, enumerates the options
+available on the machine, and verifies its own work against the actual
+system state — that verification, not a list of allowed commands, is
+the safeguard. A human is only the maximal fallback: when the Watcher
+gives up (GAVE UP), Plan B opens an outbound tunnel so a person can
+reach the machine; the person is not a step in the repair loop.
 
 ## What the model cannot do
 

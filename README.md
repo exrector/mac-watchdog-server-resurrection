@@ -249,8 +249,9 @@ symptom is broken, the Watcher consults the registry and applies the
 highest-scored tool for that symptom. The score is the smoothed
 success rate `(successes+1)/(runs+2)` — a new tool starts neutral at
 0.5 and a tool with more evidence wins over one with a single lucky
-run — plus a small state weight (preferred 3, verified 2, candidate
-1), with faster average time breaking ties. Every tool in the registry
+run — plus a small state weight (preferred 3, verified 2), with faster
+average time breaking ties. Candidate tools are NOT in this selection:
+they run only as a last attempt (see below). Every tool in the registry
 stays eligible — none is ever deleted or crossed out, a tool simply is
 not chosen while its score is lower, and it can win again later. Proven on a real Mac: a Tailscale failure selected
 `tailscale-up` by its registry score (5/5) and recovered in 1s. With
@@ -267,15 +268,30 @@ experience: diagnostic (which symptoms mean which failure), practical
 (which tools actually help), and strategic (in what order and under
 what conditions to apply them).
 
-**Open problems (not solved yet).** How to admit a candidate tool
-safely: an experimental tool must not be tested on the real network
-connection of a remote Mac if it could cut off the only access channel.
-The admission checks (what a candidate must prove before it runs on a
-live failure) are the key unsolved piece, and the reason the model does
-not yet have write access to the tool library. The six-step cycle from
-the earlier Evolution Engine sketch (research → proposal → experiment
-→ apply → observe → decide) still applies; Adaptive Tool Evolution is
-the safer shape of it: evolve the library, not the system.
+**How a new tool enters the library (admission, implemented in
+v1.2.1).** The machine is healthy most of the time — that idle time is
+when the library grows. Once a day the reviewer (review.sh) looks at
+the accumulated incidents, researches the most frequent problem on the
+web (best-effort: Bing results fetched by the script and embedded in
+the prompt; the local model itself is offline, so without internet it
+works from its own knowledge), and proposes NEW TOOLS for it — a
+better repair for a recurring failure, written as a script using only
+standard macOS tools. A deterministic installer extracts the proposal
+and registers the tool as a `candidate`: the model only writes text,
+the installer mechanically validates the id and the symptom, writes
+the script, and never overwrites an existing tool. The candidate then
+gets its chance in the next real incident as a **last attempt**: after
+every admitted tool for the symptom failed, the best-ranked candidate
+runs (at most two per incident), and only independent verification of
+the fix counts toward its record. A candidate that fixes the symptom
+earns a success and can be promoted by the model's evaluation (capped
+by the controller's evidence thresholds: preferred needs 3+ runs and
+0.8 success); one that fails stays a candidate and is tried again next
+time — still only as a last attempt. The six-step cycle from the
+earlier Evolution Engine sketch (research → proposal → experiment →
+apply → observe → decide) is now closed: research happens in idle
+time, the experiment is the last attempt in a real failure, and the
+decision is the tool's own verified record.
 
 **Audit fixes (v1.2.0, ChatGPT review of 62362e5).** An independent
 audit found eight issues; all were verified against the code and fixed:
@@ -566,8 +582,12 @@ There are **no binaries in this repository**.
   deliberate trade-off: a watchdog that cannot act cannot heal. It is
   also the largest risk surface in this project — a mistaken command
   can change settings or damage files. Scope it to the machine's
-  purpose and keep the machine's own access controls in mind. A future
-  version should restrict the model to a fixed set of repair operations.
+  purpose and keep the machine's own access controls in mind. There is
+  deliberately no command whitelist and no human in the loop: the
+  model works from the standard macOS tools and verifies its own work
+  against the actual system state, and a human is only the maximal
+  fallback — GAVE UP opens Plan B (call-home) so a person can reach
+  the machine, not a step in the repair loop.
 - **What the model cannot do.** It cannot see the screen, and it cannot
   read files under `~/Documents` from a LaunchAgent (macOS TCC) — which
   is why everything lives in `~/watchdog` and the backup.

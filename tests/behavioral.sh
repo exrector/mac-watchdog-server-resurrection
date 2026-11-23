@@ -19,6 +19,12 @@
 #   6. filter_hypotheses_by_symptoms: capped at 10 rows, refuted ones
 #      excluded.
 #   7. Lock: a stale lock (dead PID) is removed; a live lock skips.
+#   8. Candidate selection: only candidates are listed, ranked by the
+#      same smoothed rate; admitted tools are not in the list.
+#   9. Last attempt: when the admitted tool fails, a candidate runs
+#      and its verified success is recorded.
+#  10. New-tool installer: a NEW-TOOL proposal is installed as a
+#      candidate; a bad id is rejected; re-installing is a no-op.
 #
 # Usage: zsh tests/behavioral.sh   (exit 0 = all pass, exit 1 = failure)
 
@@ -37,15 +43,22 @@ check() { # check <label> <expected> <actual>
 
 # --- Load the pure functions from watcher.sh (without running it). ---
 export WATCHDOG_DIR="$TMP/wd" TOOLS="$TMP/tools.tsv" LOG="$TMP/watcher.log"
+ATTEMPTS="$TMP/tool-attempts.log"
 mkdir -p "$WATCHDOG_DIR" "$WATCHDOG_DIR/tools"
-: > "$LOG"
-for _fn in select_tool_for_symptom tool_is_implemented verify_hypothesis \
+: > "$LOG"; : > "$ATTEMPTS"
+for _fn in select_tool_for_symptom select_candidate_for_symptom \
+           tool_is_implemented verify_hypothesis \
            apply_tool_evals filter_history_by_symptoms \
-           filter_hypotheses_by_symptoms record_tool_run; do
+           filter_hypotheses_by_symptoms record_tool_run run_reflexes; do
   _src=$(sed -n "/^$_fn()/,/^}/p" "$WATCHER")
   [ -n "$_src" ] || { echo "FAIL: function $_fn not found in watcher.sh"; exit 1; }
   eval "$_src"
 done
+# install_new_tools lives in review.sh.
+REVIEW="$ROOT/review.sh"
+_src=$(sed -n '/^install_new_tools()/,/^}/p' "$REVIEW")
+[ -n "$_src" ] || { echo "FAIL: install_new_tools not found in review.sh"; exit 1; }
+eval "$_src"
 
 # --- 1. Ranking. ---
 printf 'id\tname\tstate\truns\tsuccesses\ttotal_seconds\tincident_types\n' > "$TOOLS"
@@ -161,5 +174,71 @@ else
   pass "lock: live lock skips the run"
 fi
 kill $_bg2 2>/dev/null; wait $_bg2 2>/dev/null; rm -f "$LOCK"
+
+# --- 8. Candidate selection: candidates only, ranked by rate. ---
+printf 'id\tname\tstate\truns\tsuccesses\ttotal_seconds\tincident_types\n' > "$TOOLS"
+printf 'tailscale-up\ttailscale-up\tpreferred\t10\t9\t10\ttailscale\n' >> "$TOOLS"
+printf 'cand-a\tcand-a\tcandidate\t4\t3\t8\ttailscale\n' >> "$TOOLS"
+printf 'cand-b\tcand-b\tcandidate\t0\t0\t0\ttailscale\n' >> "$TOOLS"
+printf 'cand-c\tcand-c\tcandidate\t2\t0\t4\ttailscale\n' >> "$TOOLS"
+_cands=$(select_candidate_for_symptom tailscale)
+_first_cand=$(echo "$_cands" | head -1)
+check "candidate-select: best-rate candidate first" "cand-a" "$_first_cand"
+echo "$_cands" | grep -q "tailscale-up" && fail "candidate-select: admitted tool listed" || pass "candidate-select: admitted tool excluded"
+check "candidate-select: three candidates listed" "3" "$(echo "$_cands" | wc -l | tr -d ' ')"
+
+# --- 9. Last attempt: the admitted tool fails, the candidate runs. ---
+# Stub the macOS reflexes and the verifier: the admitted tool does not
+# fix the symptom, the candidate does.
+printf 'id\tname\tstate\truns\tsuccesses\ttotal_seconds\tincident_types\n' > "$TOOLS"
+printf 'tailscale-up\ttailscale-up\tpreferred\t10\t9\t10\ttailscale\n' >> "$TOOLS"
+printf 'tailscale-restart\ttailscale-restart\tcandidate\t0\t0\t0\ttailscale\n' >> "$TOOLS"
+cat > "$WATCHDOG_DIR/tools/tailscale-restart.sh" <<'SH'
+#!/bin/zsh
+touch "$WATCHDOG_DIR/candidate-ran"
+SH
+chmod +x "$WATCHDOG_DIR/tools/tailscale-restart.sh"
+reflex_tailscale() { :; }  # admitted tool runs but fixes nothing
+_verify_n=0
+verify_item_settle() {
+  _verify_n=$((_verify_n + 1))
+  # First call (after the admitted tool): still broken. Second call
+  # (after the candidate): fixed.
+  [ "$_verify_n" -ge 2 ]
+}
+BROKEN_ITEMS=(tailscale)
+SYMPTOMS="tailscale"
+REFLEX_TS_KIND=""
+run_reflexes
+grep -q "LAST-ATTEMPT tailscale -> tailscale-restart" "$LOG" && pass "last-attempt: candidate tried after admitted failure" || fail "last-attempt: candidate not tried"
+[ -f "$WATCHDOG_DIR/candidate-ran" ] && pass "last-attempt: candidate script executed" || fail "last-attempt: candidate script did not run"
+_cand_runs=$(awk -F'\t' '$1=="tailscale-restart"{print $4}' "$TOOLS")
+_cand_ok=$(awk -F'\t' '$1=="tailscale-restart"{print $5}' "$TOOLS")
+check "last-attempt: candidate run recorded" "1" "$_cand_runs"
+check "last-attempt: candidate success recorded" "1" "$_cand_ok"
+
+# --- 10. New-tool installer: proposal -> candidate, bad id rejected. ---
+printf 'id\tname\tstate\truns\tsuccesses\ttotal_seconds\tincident_types\n' > "$TOOLS"
+cat > "$TMP/proposals.md" <<'EOF'
+## 2026-11-24 01:30:00 Daily review
+NEW-TOOL: dns-flush-plus | dns | also flushes the mDNSResponder cache
+SCRIPT:
+dscacheutil -flushcache
+killall -HUP mDNSResponder
+END-SCRIPT
+NEW-TOOL: ../../etc-evil | tailscale | bad id must be rejected
+SCRIPT:
+echo pwned
+END-SCRIPT
+EOF
+install_new_tools "$TMP/proposals.md"
+_state=$(awk -F'\t' '$1=="dns-flush-plus"{print $3}' "$TOOLS")
+check "installer: new tool registered as candidate" "candidate" "$_state"
+[ -x "$WATCHDOG_DIR/tools/dns-flush-plus.sh" ] && pass "installer: script installed and executable" || fail "installer: script missing or not executable"
+awk -F'\t' '$1=="etc-evil"{found=1} END{exit found?0:1}' "$TOOLS" && fail "installer: bad id was registered" || pass "installer: bad id rejected"
+[ -f "$WATCHDOG_DIR/tools/etc-evil.sh" ] && fail "installer: bad id wrote a file" || pass "installer: bad id wrote no file"
+install_new_tools "$TMP/proposals.md"
+_count=$(awk -F'\t' '$1=="dns-flush-plus"' "$TOOLS" | wc -l | tr -d ' ')
+check "installer: re-install is a no-op" "1" "$_count"
 
 if [ "$FAIL" -eq 0 ]; then echo "ALL BEHAVIORAL TESTS PASSED"; exit 0; else echo "BEHAVIORAL TESTS FAILED"; exit 1; fi

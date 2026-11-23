@@ -122,6 +122,21 @@ what to change, why, what it is expected to achieve, and how to verify
 it. If nothing is worth changing, say "NO CHANGE NEEDED" — do not
 invent work.
 
+**How new tools enter the library.** The machine is healthy most of
+the time — that idle time is when the library grows. The reviewer
+researches the most frequent problem on the web (the script fetches
+search results for the offline model) and proposes NEW TOOLS for it: a
+better repair for a recurring failure, as a script using only standard
+macOS tools. A deterministic installer registers the tool as a
+candidate — the model only writes text, it never touches files. The
+candidate gets its chance in the next real incident as a last attempt,
+after every admitted tool failed, and only independent verification of
+the fix counts toward its record. A candidate that fixes the symptom
+earns a success and can be promoted; one that fails stays a candidate.
+The model never rewrites an existing tool and never deletes one — a
+new tool is added alongside, and the statistics decide which one is
+preferred.
+
 ## Health checklist — Check each item ONCE. Do not re-run a Check that already returned Good.
 
 Skip an item when it is not configured for this machine: skip item 1

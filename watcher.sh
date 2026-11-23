@@ -420,11 +420,33 @@ record_hypothesis() {
 # question is the point of the whole system.
 # Arguments: $1 = outcome (FIXED-BY-REFLEX | FIXED-BY-MODEL | GAVE-UP),
 #            $2 = symptoms (the BROKEN list at detection time).
+# Filter the incident history to blocks whose SYMPTOMS share at least
+# one word with the current symptoms. Without this, a dominant pattern
+# (e.g. six DNS incidents) overwhelms the analyst: it attributes a new,
+# different incident (Tailscale) to the frequent pattern instead of
+# analysing the current symptoms. The history is only useful for
+# same-symptom recurrence.
+filter_history_by_symptoms() {
+  local file="$1" symptoms="$2" maxlines="$3"
+  [ -f "$file" ] || return 0
+  awk -v sym="$symptoms" -v max="$maxlines" '
+    function flush() {
+      if (block == "") return
+      n = split(sym, s, " ")
+      for (i = 1; i <= n; i++) {
+        if (index(symline, s[i]) > 0) { print block; return }
+      }
+    }
+    /^=== / { flush(); block = $0 "\n"; symline = ""; next }
+    { block = block $0 "\n"; if ($1 == "SYMPTOMS:") symline = $0 }
+    END { flush() }
+  ' "$file" 2>/dev/null | tail -n "$maxlines"
+}
 call_analyst() {
   local outcome="$1" symptoms="$2"
   local history="" events="" hypotheses=""
   if [ -f "$INCIDENTS" ]; then
-    history=$(tail -n "$INCIDENT_HISTORY_LINES" "$INCIDENTS" 2>/dev/null)
+    history=$(filter_history_by_symptoms "$INCIDENTS" "$symptoms" "$INCIDENT_HISTORY_LINES" 2>/dev/null)
   fi
   if [ -f "$EVENTS" ]; then
     events=$(tail -n 30 "$EVENTS" 2>/dev/null)

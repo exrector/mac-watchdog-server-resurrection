@@ -1,0 +1,65 @@
+# Build recovery-agent on a clean macOS runner and attach it to a GitHub Release.
+#
+# Why: the repo contains no binaries (source only). Users who do not want
+# to build from source download the prebuilt binary from a Release.
+# Building here (on GitHub's runner) also guarantees the binary has no
+# personal paths in it — it is built in a clean environment, not on the
+# author's machine.
+#
+# Trigger: pushing a tag like v1.0.0 creates a Release with the binary.
+# The workflow builds with full Xcode (the runner image ships Xcode),
+# because the agent uses Foundation Models macros (@Generable, @Guide)
+# whose compiler plugin is not in Command Line Tools alone.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Build recovery-agent
+        run: |
+          cd src/recovery-agent
+          swift build -c release
+
+      - name: Self-test the built agent
+        # The runner is a VM without Apple Intelligence (deviceNotEligible),
+        # so the self-test is expected to fail here. It only proves the
+        # binary runs and reports availability correctly; the real model
+        # check happens on the user's Mac. Do not fail the build for it.
+        continue-on-error: true
+        run: |
+          cd src/recovery-agent
+          ./.build/release/recovery-agent selftest || echo "NOTE: self-test failed as expected on a CI runner without Apple Intelligence (deviceNotEligible). The binary itself built fine."
+
+      - name: Stage the binary
+        run: |
+          mkdir -p dist
+          cp src/recovery-agent/.build/release/recovery-agent dist/recovery-agent
+          cd dist
+          shasum -a 256 recovery-agent > recovery-agent.sha256
+          ls -la
+
+      - name: Create the Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/recovery-agent
+            dist/recovery-agent.sha256
+          generate_release_notes: true

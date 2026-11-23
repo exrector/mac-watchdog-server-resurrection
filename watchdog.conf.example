@@ -1,0 +1,75 @@
+# macOS Watchdog — configuration
+# Copy this file to watchdog.conf and edit the values for your machine.
+# The installer (install.sh) creates watchdog.conf from this example and
+# auto-detects the values it can (Tailscale hostname, gateway, Wi-Fi
+# interface) when Tailscale is installed. Never commit a filled-in
+# watchdog.conf: it contains your hostnames and addresses. It is in
+# .gitignore.
+#
+# Paths: $HOME is expanded when this file is sourced by the scripts.
+
+# Directory where the watchdog lives (scripts, blueprint, logs).
+WATCHDOG_DIR="$HOME/watchdog"
+
+# Backup directory for self-healing. The bootstrap agent restores missing
+# files from here. Keep it OUTSIDE the watchdog dir (launchd cannot read
+# ~/Documents, and a wipe of the watchdog dir must not take the backup).
+BACKUP_DIR="$HOME/Library/Application Support/MacWatchdog/backup"
+
+# How often the Watcher runs (seconds). 300 = every 5 minutes.
+CHECK_INTERVAL=300
+
+# --- Network identity (fill in for YOUR machine) ---
+# Your node's hostname as shown in `tailscale status` (first line, 2nd field).
+# Example: if `tailscale status` shows "100.64.0.5  mac-mini  you@  macOS",
+# then TAILSCALE_HOSTNAME="mac-mini".
+TAILSCALE_HOSTNAME="mac-mini"
+
+# Path to the Tailscale CLI inside the GUI app bundle.
+TAILSCALE_CLI="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+
+# Wi-Fi interface name (usually en1 on Apple Silicon Macs, en0 on some).
+WIFI_INTERFACE="en1"
+
+# Ping target used to test internet connectivity.
+PING_TARGET="8.8.8.8"
+
+# Host used to test DNS resolution.
+DNS_TEST_HOST="example.net"
+
+# Expected default gateway. If set, the Watcher verifies the route points
+# here. If empty, it accepts ANY default gateway (recommended unless your
+# gateway address is fixed). Example: EXPECTED_GATEWAY="192.168.0.1"
+EXPECTED_GATEWAY=""
+
+# --- Plan B: outbound rendezvous tunnel ---
+# When the Watcher gives up after 3 failed repair attempts, it opens an
+# outbound SSH tunnel to this host so you can reach the machine from
+# outside (NAT blocks inbound connections; outbound works). The tunnel is
+# -R <port>:127.0.0.1:22, so from the rendezvous host you SSH to
+# localhost:<port> and land on this Mac.
+# RENDEZVOUS_HOST is "user@host" (host can be a Tailscale IP or DNS name).
+RENDEZVOUS_HOST="user@100.64.0.1"
+# Port the tunnel listens on at the rendezvous host. Pick an unused one.
+RENDEZVOUS_PORT="22999"
+# SSH key used for the tunnel (dedicated key, no passphrase, used ONLY for
+# this tunnel). Generate with: ssh-keygen -t ed25519 -f ~/.ssh/mac-watchdog-call-home -N ""
+# and add its public key to the rendezvous host's ~/.ssh/authorized_keys.
+CALL_HOME_KEY="$HOME/.ssh/mac-watchdog-call-home"
+
+# --- Secrets ---
+# Secrets are stored in the macOS Keychain by default (see
+# scripts/setup-secrets.sh). The fallback is a 600 file. Do NOT put secret
+# values in this config file.
+KEYCHAIN_SERVICE="mac-watchdog"
+SECRETS_FILE="$HOME/.config/mac-watchdog/secrets"
+
+# --- Model / Watcher tuning ---
+# Seconds the model gets per repair attempt (0 = no limit is NOT allowed;
+# keep this bounded, the model can loop forever on a broken prompt).
+MODEL_TIMEOUT=240
+# How many repair attempts before the Watcher gives up and calls home.
+MAX_ATTEMPTS=3
+# Log size control: when watcher.log exceeds this many lines, keep the
+# newest half. 0 disables trimming.
+LOG_MAX_LINES=2000

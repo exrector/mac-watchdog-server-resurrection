@@ -1,0 +1,33 @@
+# Mac Watchdog Server Resurrection — never commit secrets, configs or logs.
+# The real watchdog.conf is created by install.sh from watchdog.conf.example
+# and holds your hostnames and addresses.
+watchdog.conf
+# The secrets file (mode 600) and anything that looks like a secret.
+secrets
+*secret*
+*password*
+*authkey*
+*.pem
+*.key
+# Runtime state and logs (created on the installed machine, not in the repo).
+*.log
+last-reasoning.txt
+watcher.lock
+.DS_Store
+# The backup directory is machine state, not source.
+backup/
+__pycache__/
+# Swift build products. The installer builds recovery-agent from
+# src/recovery-agent/ on the user's machine; build output must never
+# be committed. The built binary lives inside .build/, so excluding
+# the directory covers it (also listed explicitly below).
+src/recovery-agent/.build/
+src/recovery-agent/.build/release/recovery-agent
+DerivedData/
+*.o
+*.d
+*.swiftmodule
+*.swiftsourceinfo
+# A prebuilt recovery-agent downloaded from a Release and placed next to
+# install.sh must never be committed either — it is fetched, not sourced.
+/recovery-agent

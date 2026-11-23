@@ -208,13 +208,13 @@ a significant one: it turns the system from a watchdog with a memory
 into an autonomous evolving system. That decision belongs to the human
 who owns the machine.
 
-## v1.1 — Adaptive Tool Evolution (planned)
+## v1.1 — Adaptive Tool Evolution
 
-The next milestone: the system improves by evolving its TOOL LIBRARY,
-not by rewriting itself. This is safer than self-modification of the
-running system: a new tool is ADDED alongside the old ones, and the
-statistics decide which one is preferred. Nothing that works is ever
-deleted or modified — it is only demoted.
+The system improves by evolving its TOOL LIBRARY, not by rewriting
+itself. This is safer than self-modification of the running system: a
+new tool is ADDED alongside the old ones, and the statistics decide
+which one is preferred. Nothing that works is ever deleted or
+modified — it is only demoted.
 
 **The library.** Each reflex is a tool with an id, a version, a
 checksum, a run history, and an effectiveness score (`tools.tsv`,
@@ -240,10 +240,18 @@ five built-in reflexes are the initial tools, all in state `preferred`.
 - `retired` — no longer chosen by default, but preserved in the
   library as a fallback.
 
-**Selection.** Priorities are data, not opinion: success rate AND
-recovery time AND side effects AND repeat-failure frequency, per
-incident type. A tool that is fast but causes repeat failures is worse
-than a slower one that holds.
+**Selection (implemented).** Priorities are data, not opinion. When a
+symptom is broken, the Watcher consults the registry and applies the
+highest-scored tool for that symptom. The score is the smoothed
+success rate `(successes+1)/(runs+2)` — a new tool starts neutral at
+0.5 and a tool with more evidence wins over one with a single lucky
+run — plus a small state weight (preferred 3, verified 2, candidate
+1), with faster average time breaking ties. Retired tools are never
+selected. Proven on a real Mac: a Tailscale failure selected
+`tailscale-up` by its registry score (5/5) and recovered in 1s. With
+one tool per symptom today the choice is trivial; the mechanism is
+what matters — when a new tool is added for a symptom, the best one
+wins automatically.
 
 **Strategies.** The most interesting level: the model can improve not
 the tools but their COMBINATION — discovering that a certain sequence

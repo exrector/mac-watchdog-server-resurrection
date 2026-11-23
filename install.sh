@@ -98,11 +98,15 @@ fi
 # The repo contains NO binaries. Two ways to get the agent:
 #   A. Place a prebuilt `recovery-agent` next to install.sh (downloaded from
 #      the Releases page) — the installer uses it as-is, no Xcode needed.
+#      A download (curl, browser) may arrive without the executable bit;
+#      the installer sets it, so a non-executable file is not mistaken
+#      for a missing one.
 #   B. Otherwise, build it from the Swift source in src/recovery-agent/.
 #      The agent uses Foundation Models macros (@Generable, @Guide), whose
 #      compiler plugin ships only with full Xcode — Command Line Tools alone
 #      is NOT enough.
-if [ -x "$SRC_DIR/recovery-agent" ]; then
+if [ -f "$SRC_DIR/recovery-agent" ]; then
+  chmod +x "$SRC_DIR/recovery-agent" 2>/dev/null || true
   BUILT_AGENT="$SRC_DIR/recovery-agent"
   echo "Using prebuilt recovery-agent next to install.sh (no build needed)."
 elif ! command -v swift >/dev/null 2>&1; then

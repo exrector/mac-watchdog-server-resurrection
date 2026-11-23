@@ -75,35 +75,65 @@ need this.
 
 ## How it works
 
+This is an autonomous immune system, not a watchdog with a model bolted
+on. It has layers, and the model is the analyst — not the repairman.
+
 ```
 LaunchAgent (every CHECK_INTERVAL, default 5 min)
    └─ watcher.sh
        ├─ deterministic health check (Wi-Fi, ping, DNS, route, Tailscale)
-       ├─ if healthy: log HEALTHY and stop (the model is NOT woken)
-       ├─ if broken: wake the local model (recovery-agent)
-       │     model reads blueprint.md, repairs only the broken items,
-       │     and reports one line per item with the exact command output
-       ├─ independent VERIFY (the script re-checks everything itself;
-       │     the verdict comes from the checks, never from the model's words)
-       ├─ up to 3 attempts, then GAVE UP
-       └─ on GAVE UP: call-home.sh opens the outbound tunnel (Plan B)
+       ├─ if healthy: log HEALTHY and stop (nothing is woken)
+       ├─ if broken: REFLEXES — deterministic repair for KNOWN problems
+       │     (Wi-Fi on, DNS reset, route add, Tailscale up / re-login)
+       │     No model involved: a script does these better.
+       ├─ re-check. If healthy: ANALYST — the local model investigates
+       │     WHY it happened, using the observer's pre-failure record
+       │     and the incident history, and records the incident
+       │     (problem, cause + confidence, fix, outcome).
+       ├─ if still broken: ESCALATION — the model acts as repairman
+       │     (the problem is unknown), up to 3 attempts, each verified
+       │     independently; then the analyst records it.
+       └─ if still broken: GAVE UP — analyst records it, Plan B opens
+observer.sh (every minute, own LaunchAgent)
+   └─ appends one line to events.log: the machine's state BEFORE any
+      failure (Wi-Fi, IP, gateway, DNS, Tailscale, uptime). The analyst
+      needs this "before" picture — without it, a cause is a guess.
 watchdog-bootstrap.sh (every 5 min, from outside the watchdog dir)
    └─ restores any missing watchdog file from the backup copy
 ```
 
 The key design decision: **reliability comes from the loop
-(check → model → independent re-check), not from the model itself.**
-The local model is small and can be wrong — it sometimes stops after one
-step, or claims success it did not achieve. The deterministic VERIFY
-catches that. The model is the hands; the script is the judge.
+(check → reflex → independent re-check), not from the model.** The
+model is small and can be wrong at executing procedures — it sometimes
+stops after one step, or claims success it did not achieve. So it does
+not execute the routine fixes. What it is good at is reasoning about
+unfamiliar states, spotting patterns across incidents, and explaining
+what happened. That is its job here: analyst, not repairman.
+
+**Incident memory** (`incidents.log`) is what makes the system learn.
+Every incident is recorded with its symptoms, the reflexes tried, the
+outcome, and the model's analysis. The analysis answers three
+questions, in order: **What broke? Why does it keep happening? What
+should change so it does not happen again?** The third question is the
+point of the whole system. A problem seen three times and fixed the
+same way is a known problem — next time the reflex handles it without
+the model. The model reads the recent history on every call, so it can
+say "this DNS failure is the third this week" instead of starting from
+zero. It also judges its own past hypotheses: if a cause it proposed
+turns out wrong, that is recorded and lowers that hypothesis's
+standing.
 
 The model's reasoning (every command it ran, its exit code and outcome)
 is saved to `last-reasoning.txt` after each run, so you can see exactly
 what it did and why.
 
-## What it repairs
+## What the reflexes repair
 
-| Problem | Repair |
+The five known problems, fixed deterministically by the script (no
+model involved). If a reflex fails, the problem is by definition not
+one of these — that is when the model is escalated to.
+
+| Problem | Reflex |
 |---|---|
 | Wi-Fi off | `networksetup -setairportpower <interface> on` |
 | DNS broken | `networksetup -setdnsservers Wi-Fi Empty` |
@@ -185,9 +215,9 @@ The installer:
    terminal and sudo. This is a speed bump, not a guarantee: the owner
    or root can remove the flag with `chflags nouchg`. Logs and the
    config stay writable.
-7. Installs and loads the LaunchAgents: `com.macwatchdog.watcher` and
-   `com.macwatchdog.bootstrap` (always), plus `com.macwatchdog.call-home`
-   only with `--with-call-home`.
+7. Installs and loads the LaunchAgents: `com.macwatchdog.watcher`,
+   `com.macwatchdog.bootstrap` and `com.macwatchdog.observer` (always),
+   plus `com.macwatchdog.call-home` only with `--with-call-home`.
 8. Runs `scripts/setup-secrets.sh` to store the sudo password and the
    Tailscale auth key (see Secrets below).
 

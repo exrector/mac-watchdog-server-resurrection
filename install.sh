@@ -159,7 +159,7 @@ chflags -R nouchg "$INSTALL_DIR" 2>/dev/null || true
 chflags -R nouchg "$BACKUP_DIR" 2>/dev/null || true
 
 # --- 3. Copy source files ---
-for f in watcher.sh blueprint.md reasoning.py click-allow.sh call-home.sh call-home-loop.sh watchdog-bootstrap.sh watchdog.conf.example; do
+for f in watcher.sh blueprint.md reasoning.py click-allow.sh call-home.sh call-home-loop.sh watchdog-bootstrap.sh observer.sh watchdog.conf.example; do
   cp "$SRC_DIR/$f" "$INSTALL_DIR/$f"
   cp "$SRC_DIR/$f" "$BACKUP_DIR/$f"
 done
@@ -244,7 +244,7 @@ fi
 # This is a speed bump, not a guarantee: the owner or root can remove
 # the flag with `chflags nouchg`. Logs stay writable.
 for d in "$INSTALL_DIR" "$BACKUP_DIR"; do
-  chflags uchg "$d/watcher.sh" "$d/blueprint.md" "$d/recovery-agent" "$d/reasoning.py" "$d/click-allow.sh" "$d/call-home.sh" "$d/call-home-loop.sh" "$d/watchdog-bootstrap.sh" "$d/lib/get-secret.sh" "$d/scripts/setup-secrets.sh" 2>/dev/null || true
+  chflags uchg "$d/watcher.sh" "$d/blueprint.md" "$d/recovery-agent" "$d/reasoning.py" "$d/click-allow.sh" "$d/call-home.sh" "$d/call-home-loop.sh" "$d/watchdog-bootstrap.sh" "$d/observer.sh" "$d/lib/get-secret.sh" "$d/scripts/setup-secrets.sh" 2>/dev/null || true
 done
 chflags uchg "$SUPPORT_DIR/watchdog-bootstrap.sh" 2>/dev/null || true
 echo "Source files marked chflags uchg (immutable). Config and logs stay writable."
@@ -260,7 +260,7 @@ if [ "$DO_AGENTS" -eq 1 ]; then
   _ci="${CHECK_INTERVAL:-300}"
   _wd_esc=$(sed_escape "$WATCHDOG_DIR")
   _sup_esc=$(sed_escape "$SUPPORT_DIR")
-  _agents="watcher bootstrap"
+  _agents="watcher bootstrap observer"
   if [ "$DO_CALL_HOME" -eq 1 ]; then
     _agents="$_agents call-home"
   fi
@@ -308,6 +308,8 @@ echo "  Watchdog dir: $INSTALL_DIR"
 echo "  Backup dir:   $BACKUP_DIR"
 echo "  Config:       $CONF"
 echo "  Logs:         $INSTALL_DIR/watcher.log, $INSTALL_DIR/bootstrap.log, $INSTALL_DIR/call-home.log"
+echo "  Incidents:    $INSTALL_DIR/incidents.log (problem, cause, fix, outcome)"
+echo "  Events:       $INSTALL_DIR/events.log (state every minute, for the analyst)"
 echo "  Reasoning:    $INSTALL_DIR/last-reasoning.txt (updated after every run)"
 echo
 echo "Next steps:"

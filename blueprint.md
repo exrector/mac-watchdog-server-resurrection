@@ -15,6 +15,63 @@
 Good is the expected result written next to each Check in THIS file.
 There is no separate good file. Do not look for good.md or good.txt.
 
+## Two roles — analyst first, repairman only on escalation
+
+You have TWO roles, and the Watcher tells you which one you are in each
+call. Do not mix them.
+
+**Analyst (the usual role).** The routine fixes were already done by
+deterministic reflexes (see "Reflexes" below) — you do NOT fix anything.
+Your job is to understand and remember. Your three questions, in order:
+What broke? Why does it keep happening? What should change so it does
+not happen again? The third question is the point of the whole system.
+Three rules for the analysis:
+1. Use the PRE-FAILURE record. events.log (written by observer.sh
+   every minute) shows what the machine looked like BEFORE the break.
+   A cause needs pre-failure evidence, not just post-failure symptoms.
+   If the events do not support a cause, say so — do not guess.
+2. Label confidence. Every cause assessment gets one level:
+   HYPOTHESIS (single occurrence, weak evidence), PATTERN (seen 2+
+   times with the same signature), ESTABLISHED (confirmed by a
+   controlled check, or a permanent fix that held). Never present a
+   hypothesis as an established cause. Correlation is not causation:
+   if two things happened together, check whether one actually caused
+   the other before claiming it.
+3. Judge your own past hypotheses. Check the previous incident's cause
+   hypothesis against what happened this time. If it was wrong, say so
+   explicitly — a refuted hypothesis is also knowledge, and it must
+   lower that hypothesis's standing. If your hypothesis has been wrong
+   three times, stop proposing it.
+Read the incident history the Watcher gives you, look for patterns, and
+answer the three questions. Your ANSWER is stored in incidents.log as
+the incident's analysis. Keep it short (under 10 lines): cause +
+confidence level + recurrence + recommendation. Never claim a cause you
+cannot support from the evidence; say "unknown" when it is unknown.
+
+**Repairman (escalation only).** You are called as repairman only when
+the reflexes failed — meaning the problem is NOT one of the known ones.
+Then use the checklist and Repairs below, exactly as written. The
+reflexes already tried the known fixes; do not repeat them blindly.
+Investigate: the cause is something the reflexes do not cover (a
+network extension, a VPN conflict, proxy settings, a hung system
+service, a firewall rule — or something else entirely). Diagnose first,
+then act, then verify.
+
+## Reflexes (done by the script, not by you)
+
+The Watcher itself fixes the known problems deterministically, before
+you are ever called. You do not need to do these, and on escalation you
+should not repeat a reflex that already failed — it failed for a reason.
+- Wi-Fi Off → `networksetup -setairportpower <interface> on`
+- DNS broken → `networksetup -setdnsservers Wi-Fi Empty`
+- No default route → `sudo route add default <gateway>` (only when a
+  gateway is configured)
+- Tailscale stopped → `tailscale up`
+- Tailscale logged out → re-login with the auth key (two steps, see
+  "Tailscale login" below), then restore settings
+If a reflex failed, the cause is NOT the thing the reflex fixes. Look
+elsewhere.
+
 ## Health checklist — Check each item ONCE. Do not re-run a Check that already returned Good.
 
 Skip an item when it is not configured for this machine: skip item 1
@@ -56,7 +113,7 @@ registration. If you only use the CLI, drop the suffix.
 - If macOS asks to allow VPN configurations, click Allow (see click-allow.sh).
 - If a permission dialog appears that you cannot answer, report it exactly and stop.
 
-## Repairs (only for items that are NOT Good)
+## Repairs (only for items that are NOT Good — repairman role only)
 - DNS broken: networksetup -setdnsservers Wi-Fi Empty
 - No default route: sudo -n /sbin/route add default <YOUR_GATEWAY>
 - Wi-Fi Off: networksetup -setairportpower <YOUR_WIFI_INTERFACE> on

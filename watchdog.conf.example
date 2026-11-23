@@ -74,8 +74,15 @@ SECRETS_FILE="$HOME/.config/mac-watchdog/secrets"
 # Seconds the model gets per repair attempt (0 = no limit is NOT allowed;
 # keep this bounded, the model can loop forever on a broken prompt).
 MODEL_TIMEOUT=240
-# How many repair attempts before the Watcher gives up and calls home.
+# How many repair attempts the model gets (as repairman, on escalation)
+# before the Watcher gives up and calls home.
 MAX_ATTEMPTS=3
+# How many lines of recent incident history to show the analyst, so it
+# can spot recurring problems. 0 disables the history (not recommended).
+INCIDENT_HISTORY_LINES=80
+# How many lines of state snapshots the observer keeps (one line per
+# minute). When events.log exceeds this, the oldest half is dropped.
+EVENTS_MAX_LINES=2000
 # Log size control: when watcher.log exceeds this many lines, keep the
 # newest half. 0 disables trimming.
 LOG_MAX_LINES=2000

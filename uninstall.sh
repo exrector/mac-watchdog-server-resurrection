@@ -40,7 +40,7 @@ done
 
 echo "Mac Watchdog Server Resurrection — uninstaller"
 echo "This will remove:"
-echo "  LaunchAgents: com.macwatchdog.{watcher,bootstrap,call-home}"
+echo "  LaunchAgents: com.macwatchdog.{watcher,bootstrap,observer,call-home}"
 echo "  Install dir:  $INSTALL_DIR"
 echo "  Support dir:  $SUPPORT_DIR (includes the backup)"
 echo "Secrets in the Keychain and ~/.config/mac-watchdog/secrets are NOT removed (see docs/security.md)."
@@ -56,7 +56,7 @@ if [ "$AUTO" -eq 0 ]; then
 fi
 
 _uid=$(id -u)
-for p in watcher bootstrap call-home; do
+for p in watcher bootstrap observer call-home; do
   _plist="$HOME/Library/LaunchAgents/com.macwatchdog.$p.plist"
   launchctl bootout "gui/$_uid" "$_plist" 2>/dev/null || true
   rm -f "$_plist" 2>/dev/null

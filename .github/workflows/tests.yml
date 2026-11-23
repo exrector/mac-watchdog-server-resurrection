@@ -44,7 +44,7 @@ jobs:
           # This is the check that would have caught the *secret* gitignore bug.
           for f in watcher.sh blueprint.md reasoning.py click-allow.sh \
                    call-home.sh call-home-loop.sh watchdog-bootstrap.sh \
-                   watchdog.conf.example lib/get-secret.sh \
+                   observer.sh watchdog.conf.example lib/get-secret.sh \
                    scripts/setup-secrets.sh; do
             if ! git ls-files --error-unmatch "$f" >/dev/null 2>&1; then
               echo "MISSING FROM REPO (but install.sh copies it): $f"

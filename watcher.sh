@@ -1,7 +1,27 @@
 #!/bin/zsh
-# Watcher: deterministic health check -> local Apple Intelligence model ->
-# independent verify. If the model fails MAX_ATTEMPTS times, call home
-# (open the outbound tunnel) and give up.
+# Watcher: an autonomous immune system for this Mac.
+#
+# Layers, in order:
+#   1. Deterministic health check (verify_health) — cheap, no model.
+#   2. Reflexes — deterministic repair for KNOWN problems (Wi-Fi off,
+#      DNS broken, route missing, Tailscale stopped/logged out). Fast,
+#      predictable, safe. A script does these better than a model.
+#   3. Analyst (the local Apple Intelligence model) — after every
+#      incident, the model investigates WHY it happened, looks for
+#      patterns in the incident history, and records the incident
+#      (problem, cause hypothesis, fix, outcome) in incidents.log.
+#      The model is the analyst, not the repairman: it explains and
+#      remembers, it does not execute the routine fixes.
+#   4. Escalation — only when reflexes fail (unknown problem): the model
+#      is called as repairman, up to MAX_ATTEMPTS, with independent
+#      verification after each attempt. Then the analyst records it.
+#   5. GAVE UP — after MAX_ATTEMPTS, the analyst records the incident
+#      and the Watcher opens the outbound tunnel (Plan B).
+#
+# The verdict always comes from the deterministic checks, never from
+# the model's words. The incident memory (incidents.log) is what makes
+# the system learn: a problem seen three times and fixed the same way
+# becomes a reflex, not a model call.
 #
 # Configuration: watchdog.conf in the same directory as this script.
 # All machine-specific values (hostnames, gateway, interfaces) come from
@@ -29,14 +49,16 @@ DNS_TEST_HOST="${DNS_TEST_HOST:-example.net}"
 MODEL_TIMEOUT="${MODEL_TIMEOUT:-240}"
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"
 LOG_MAX_LINES="${LOG_MAX_LINES:-2000}"
+# How many recent incidents to show the analyst for pattern-spotting.
+INCIDENT_HISTORY_LINES="${INCIDENT_HISTORY_LINES:-80}"
 
 # Tailscale is optional: if TAILSCALE_HOSTNAME is empty, the Tailscale
-# check is skipped (the machine is used without Tailscale). It used to be
-# required, which made the Watcher unusable without Tailscale.
-# (require_var TAILSCALE_HOSTNAME removed — see verify_health.)
+# check is skipped (the machine is used without Tailscale).
 
 export WATCHDOG_DIR
 LOG="$WATCHDOG_DIR/watcher.log"
+INCIDENTS="$WATCHDOG_DIR/incidents.log"
+EVENTS="$WATCHDOG_DIR/events.log"
 BLUEPRINT="$WATCHDOG_DIR/blueprint.md"
 AGENT="$WATCHDOG_DIR/recovery-agent"
 LOCK="$WATCHDOG_DIR/watcher.lock"
@@ -89,19 +111,26 @@ run_to() {
 }
 
 # Deterministic health verification. Prints one VERIFY line per item.
-# Returns 0 only if all enabled checks are OK. A check is skipped when
-# its config is empty: Wi-Fi is skipped when WIFI_INTERFACE is empty
-# (Ethernet-only Mac), Tailscale is skipped when TAILSCALE_HOSTNAME is
-# empty (no Tailscale). A skipped check is not a failure.
+# Sets BROKEN to a space-separated list of broken item names (empty when
+# healthy) and TS_STATUS to the raw Tailscale status line (for the
+# reflex to tell "stopped" from "logged out"). Returns 0 only if all
+# enabled checks are OK. A check is skipped when its config is empty:
+# Wi-Fi is skipped when WIFI_INTERFACE is empty (Ethernet-only Mac),
+# Tailscale is skipped when TAILSCALE_HOSTNAME is empty (no Tailscale).
+# A skipped check is not a failure.
+BROKEN=""
+TS_STATUS=""
 verify_health() {
   local ok=1
   local wifi ping dns route ts
+  BROKEN=""
+  TS_STATUS=""
   if [ -n "${WIFI_INTERFACE:-}" ]; then
     wifi=$(run_to 10 networksetup -getairportpower "$WIFI_INTERFACE" 2>&1)
     if echo "$wifi" | grep -q "On"; then
       echo "VERIFY wifi OK: $wifi" >> "$LOG"
     else
-      echo "VERIFY wifi BROKEN: $wifi" >> "$LOG"; ok=0
+      echo "VERIFY wifi BROKEN: $wifi" >> "$LOG"; ok=0; BROKEN="$BROKEN wifi"
     fi
   else
     echo "VERIFY wifi SKIP (no WIFI_INTERFACE configured)" >> "$LOG"
@@ -110,39 +139,160 @@ verify_health() {
   if echo "$ping" | grep -q "1 packets received"; then
     echo "VERIFY ping OK" >> "$LOG"
   else
-    echo "VERIFY ping BROKEN: $ping" >> "$LOG"; ok=0
+    echo "VERIFY ping BROKEN: $ping" >> "$LOG"; ok=0; BROKEN="$BROKEN ping"
   fi
   dns=$(run_to 15 dig +short "$DNS_TEST_HOST" 2>&1)
   if echo "$dns" | grep -Eq "^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$"; then
     echo "VERIFY dns OK: $dns" >> "$LOG"
   else
-    echo "VERIFY dns BROKEN: $dns" >> "$LOG"; ok=0
+    echo "VERIFY dns BROKEN: $dns" >> "$LOG"; ok=0; BROKEN="$BROKEN dns"
   fi
   route=$(run_to 10 route -n get default 2>&1 | grep gateway)
   if [ -n "${EXPECTED_GATEWAY:-}" ]; then
     if echo "$route" | grep -q "$EXPECTED_GATEWAY"; then
       echo "VERIFY route OK: $route" >> "$LOG"
     else
-      echo "VERIFY route BROKEN: $route" >> "$LOG"; ok=0
+      echo "VERIFY route BROKEN: $route" >> "$LOG"; ok=0; BROKEN="$BROKEN route"
     fi
   else
     if echo "$route" | grep -q "gateway:"; then
       echo "VERIFY route OK: $route" >> "$LOG"
     else
-      echo "VERIFY route BROKEN: $route" >> "$LOG"; ok=0
+      echo "VERIFY route BROKEN: $route" >> "$LOG"; ok=0; BROKEN="$BROKEN route"
     fi
   fi
   if [ -n "${TAILSCALE_HOSTNAME:-}" ]; then
     ts=$(run_to 15 "$TAILSCALE_CLI" status 2>&1 | head -1)
+    TS_STATUS="$ts"
     if echo "$ts" | grep -q "$TAILSCALE_HOSTNAME" && ! echo "$ts" | grep -Eqi "offline|stopped"; then
       echo "VERIFY tailscale OK: $ts" >> "$LOG"
     else
-      echo "VERIFY tailscale BROKEN: $ts" >> "$LOG"; ok=0
+      echo "VERIFY tailscale BROKEN: $ts" >> "$LOG"; ok=0; BROKEN="$BROKEN tailscale"
     fi
   else
     echo "VERIFY tailscale SKIP (no TAILSCALE_HOSTNAME configured)" >> "$LOG"
   fi
+  BROKEN="${BROKEN# }"
   return $((1 - ok))
+}
+
+# --- Reflexes: deterministic repair for KNOWN problems. ---
+# Each reflex fixes one broken item with a fixed command and logs what
+# it did. No model involved: these are the five rules a script does
+# better. REFLEX_LOG accumulates a one-line summary per reflex fired,
+# for the incident record.
+REFLEX_LOG=""
+reflex_wifi() {
+  echo "REFLEX wifi: networksetup -setairportpower $WIFI_INTERFACE on" >> "$LOG"
+  run_to 15 networksetup -setairportpower "$WIFI_INTERFACE" on >> "$LOG" 2>&1
+  REFLEX_LOG="$REFLEX_LOG wifi-on(rc=$?)"
+}
+reflex_dns() {
+  echo "REFLEX dns: networksetup -setdnsservers Wi-Fi Empty" >> "$LOG"
+  run_to 15 networksetup -setdnsservers Wi-Fi Empty >> "$LOG" 2>&1
+  REFLEX_LOG="$REFLEX_LOG dns-reset(rc=$?)"
+}
+reflex_route() {
+  if [ -z "${EXPECTED_GATEWAY:-}" ]; then
+    echo "REFLEX route: SKIP (no EXPECTED_GATEWAY configured, cannot guess a gateway)" >> "$LOG"
+    REFLEX_LOG="$REFLEX_LOG route-skip(no-gateway)"
+    return 0
+  fi
+  echo "REFLEX route: sudo route add default $EXPECTED_GATEWAY" >> "$LOG"
+  run_to 15 sudo -n /sbin/route add default "$EXPECTED_GATEWAY" >> "$LOG" 2>&1
+  REFLEX_LOG="$REFLEX_LOG route-add(rc=$?)"
+}
+reflex_tailscale() {
+  # "Logged out" needs the two-step re-login with the auth key; anything
+  # else (stopped/offline) just needs `tailscale up`.
+  if echo "$TS_STATUS" | grep -qi "logged out"; then
+    echo "REFLEX tailscale: re-login (logged out)" >> "$LOG"
+    _key=$(/bin/zsh "$WATCHDOG_DIR/lib/get-secret.sh" tailscale-authkey 2>/dev/null)
+    if [ -z "$_key" ]; then
+      echo "REFLEX tailscale: no auth key available, cannot re-login" >> "$LOG"
+      REFLEX_LOG="$REFLEX_LOG tailscale-login-fail(no-key)"
+      return 0
+    fi
+    run_to 60 "$TAILSCALE_CLI" up --authkey="$_key" --reset >> "$LOG" 2>&1
+    _rc1=$?
+    run_to 30 "$TAILSCALE_CLI" up --accept-routes --hostname="${TAILSCALE_HOSTNAME}-cli" >> "$LOG" 2>&1
+    _rc2=$?
+    REFLEX_LOG="$REFLEX_LOG tailscale-login(rc=$_rc1/$_rc2)"
+  else
+    echo "REFLEX tailscale: tailscale up" >> "$LOG"
+    run_to 30 "$TAILSCALE_CLI" up >> "$LOG" 2>&1
+    REFLEX_LOG="$REFLEX_LOG tailscale-up(rc=$?)"
+  fi
+}
+# Run the reflex for every item in $BROKEN (space-separated).
+run_reflexes() {
+  REFLEX_LOG=""
+  for item in $BROKEN; do
+    case "$item" in
+      wifi) reflex_wifi ;;
+      dns) reflex_dns ;;
+      route) reflex_route ;;
+      tailscale) reflex_tailscale ;;
+      ping) echo "REFLEX ping: no direct reflex (ping is a symptom, not a cause — the other reflexes address it)" >> "$LOG" ;;
+    esac
+  done
+  REFLEX_LOG="${REFLEX_LOG# }"
+}
+
+# --- Analyst: the model as investigator, not repairman. ---
+# After an incident (fixed by reflexes, fixed by the model, or gave up),
+# the model analyses WHAT happened and WHY, looks for patterns in the
+# incident history, and the result is appended to incidents.log. The
+# model does NOT fix anything here — the fixing is already done (or has
+# failed). Its job is understanding and memory.
+#
+# Three rules for the analysis (the analyst's job description):
+#   1. Use the PRE-FAILURE record. events.log (written by observer.sh
+#      every minute) shows what the machine looked like BEFORE the
+#      break. A cause needs pre-failure evidence, not just post-failure
+#      symptoms. If the events do not support a cause, say so.
+#   2. Label confidence. Every cause assessment gets one level:
+#      HYPOTHESIS (single occurrence, weak evidence), PATTERN (seen 2+
+#      times with the same signature), ESTABLISHED (confirmed by a
+#      controlled check, or a permanent fix that held). Never present a
+#      hypothesis as an established cause.
+#   3. Judge your own past hypotheses. Check the previous incident's
+#      cause hypothesis against what happened this time. If it was
+#      wrong, say so explicitly — a refuted hypothesis is also
+#      knowledge, and it must lower that hypothesis's standing.
+# The analyst's three questions, in order: What broke? Why does it keep
+# happening? What should change so it does not happen again? The third
+# question is the point of the whole system.
+# Arguments: $1 = outcome (FIXED-BY-REFLEX | FIXED-BY-MODEL | GAVE-UP),
+#            $2 = symptoms (the BROKEN list at detection time).
+call_analyst() {
+  local outcome="$1" symptoms="$2"
+  local history="" events=""
+  if [ -f "$INCIDENTS" ]; then
+    history=$(tail -n "$INCIDENT_HISTORY_LINES" "$INCIDENTS" 2>/dev/null)
+  fi
+  if [ -f "$EVENTS" ]; then
+    events=$(tail -n 30 "$EVENTS" 2>/dev/null)
+  fi
+  local prompt="You are the analyst for this Mac's watchdog, not the repairman. Do NOT run any repair commands. Read the blueprint's Analyst section in $BLUEPRINT. An incident just happened. Symptoms: $symptoms. Reflexes tried: ${REFLEX_LOG:-none}. Outcome: $outcome. State BEFORE the failure (observer, newest last): $events. Recent incident history (newest last): $history. Analyse: what most likely caused this (use the pre-failure events, not just the symptoms), is it a repeat of an earlier incident (say which one and how many times), and was the previous incident's cause hypothesis confirmed or refuted by this one? Label your cause assessment HYPOTHESIS, PATTERN or ESTABLISHED. Answer the three questions: what broke, why does it keep happening, what should change so it does not happen again. Finish with ANSWER= followed by a short incident analysis (cause + confidence level + recurrence + recommendation). Keep it under 10 lines."
+  echo "--- analyst ---" >> "$LOG"
+  local out
+  out=$(run_to "$MODEL_TIMEOUT" "$AGENT" agent "$prompt" 2>&1)
+  local rc=$?
+  if [ "$rc" -eq 124 ]; then
+    pkill -9 -f "recovery-agent agent" 2>/dev/null
+    echo "ANALYST TIMEOUT" >> "$LOG"
+  fi
+  echo "$out" >> "$LOG"
+  # Record the incident: facts from the script + the model's analysis.
+  {
+    echo "=== $(date '+%Y-%m-%d %H:%M:%S') INCIDENT ==="
+    echo "SYMPTOMS: $symptoms"
+    echo "REFLEXES: ${REFLEX_LOG:-none}"
+    echo "OUTCOME: $outcome"
+    echo "$out" | grep -A 20 "^ANSWER=" | sed 's/^/ANALYSIS: /'
+  } >> "$INCIDENTS"
+  echo "INCIDENT recorded in $INCIDENTS" >> "$LOG"
 }
 
 PROMPT="Read $BLUEPRINT and check this Mac against it, item by item, in order. Check each item ONCE. Do not re-run a Check that already returned Good. For each item report one line: OK or BROKEN with the exact command output that proves it. Repair only the BROKEN items using the Repairs section, then re-run ONLY that item's Check. Finish with ANSWER= followed by one line per item."
@@ -154,26 +304,41 @@ if [ "${1:-}" = "--dry-run" ]; then
     echo "DRY-RUN: HEALTHY — no repair needed, model would not be woken."
     exit 0
   else
-    echo "DRY-RUN: BROKEN — the model would be woken to repair it. See VERIFY lines above."
+    echo "DRY-RUN: BROKEN ($BROKEN) — reflexes would fire, then the analyst. See VERIFY lines above."
     exit 1
   fi
 fi
 
-# Pre-check: if the machine is already healthy, do nothing. The model
-# is only woken when the deterministic check finds something broken.
-# Without this, the model would run on every tick even when nothing
-# is wrong (wasted time and context on a healthy machine).
+# 1. Pre-check: if the machine is already healthy, do nothing. The model
+# is not woken on a healthy machine.
 if verify_health; then
   echo "HEALTHY, no repair needed" >> "$LOG"
   echo "=== $(date '+%Y-%m-%d %H:%M:%S') DONE ===" >> "$LOG"
   python3 "$WATCHDOG_DIR/reasoning.py" 2>/dev/null
   exit 0
 fi
+SYMPTOMS="$BROKEN"
+echo "BROKEN items: $SYMPTOMS" >> "$LOG"
 
+# 2. Reflexes: deterministic repair for the known problems.
+run_reflexes
+
+# 3. Re-verify after the reflexes.
+if verify_health; then
+  echo "VERIFIED HEALTHY after reflexes" >> "$LOG"
+  call_analyst "FIXED-BY-REFLEX" "$SYMPTOMS"
+  echo "=== $(date '+%Y-%m-%d %H:%M:%S') DONE ===" >> "$LOG"
+  python3 "$WATCHDOG_DIR/reasoning.py" 2>/dev/null
+  exit 0
+fi
+echo "STILL BROKEN after reflexes ($BROKEN) — escalating to the model" >> "$LOG"
+
+# 4. Escalation: reflexes failed, the problem is unknown. Only now does
+# the model act as repairman, up to MAX_ATTEMPTS, with independent
+# verification after each attempt.
 attempt=1
 while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do
-  echo "--- attempt $attempt ---" >> "$LOG"
-  # Give the model MODEL_TIMEOUT seconds; kill the agent itself if it hangs.
+  echo "--- model attempt $attempt ---" >> "$LOG"
   run_to "$MODEL_TIMEOUT" "$AGENT" agent "$PROMPT" >> "$LOG" 2>&1
   rc=$?
   if [ "$rc" -eq 124 ]; then
@@ -181,18 +346,20 @@ while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do
     echo "MODEL TIMEOUT on attempt $attempt" >> "$LOG"
   fi
   if verify_health; then
-    echo "VERIFIED HEALTHY after attempt $attempt" >> "$LOG"
+    echo "VERIFIED HEALTHY after model attempt $attempt" >> "$LOG"
+    call_analyst "FIXED-BY-MODEL" "$SYMPTOMS"
     echo "=== $(date '+%Y-%m-%d %H:%M:%S') DONE ===" >> "$LOG"
     python3 "$WATCHDOG_DIR/reasoning.py" 2>/dev/null
     exit 0
   else
-    echo "STILL BROKEN after attempt $attempt" >> "$LOG"
+    echo "STILL BROKEN after model attempt $attempt" >> "$LOG"
   fi
   attempt=$((attempt + 1))
 done
 
-echo "GAVE UP after $MAX_ATTEMPTS attempts, needs a human" >> "$LOG"
-# Plan B: open the outbound channel so we can reach this machine.
+# 5. GAVE UP: the analyst records the incident, then Plan B.
+echo "GAVE UP after $MAX_ATTEMPTS model attempts, needs a human" >> "$LOG"
+call_analyst "GAVE-UP" "$SYMPTOMS"
 if [ -x "$WATCHDOG_DIR/call-home.sh" ]; then
   "$WATCHDOG_DIR/call-home.sh" >> "$LOG" 2>&1
   echo "CALL-HOME invoked" >> "$LOG"

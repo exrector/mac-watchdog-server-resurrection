@@ -74,33 +74,43 @@ if [ "$LOG_MAX_LINES" -gt 0 ] && [ -f "$LOG" ]; then
   fi
 fi
 
-# Prevent overlapping runs. The lock file holds the PID of the running
-# watcher. A bare existence check is not enough: if the process dies
-# via SIGKILL or crashes, the EXIT trap never runs and the lock stays,
-# blocking every future run forever. So the lock is validated, not
-# just checked: it is stale if its PID is gone, if the PID was reused
-# by a different process, or if it is older than 15 minutes (a single
-# watcher run finishes in minutes). A stale lock is removed and the
-# run proceeds; a live lock still skips the run.
-if [ -e "$LOCK" ]; then
-  _lock_pid=$(cat "$LOCK" 2>/dev/null | tr -d ' \t\n')
-  _lock_mtime=$(stat -f %m "$LOCK" 2>/dev/null || echo 0)
-  _lock_age=$(( $(date +%s) - _lock_mtime ))
-  _stale=0
-  if [ -z "$_lock_pid" ]; then _stale=1; fi
-  if [ "$_stale" -eq 0 ] && ! kill -0 "$_lock_pid" 2>/dev/null; then _stale=1; fi
-  if [ "$_stale" -eq 0 ] && ! ps -p "$_lock_pid" -o args= 2>/dev/null | grep -q "watcher"; then _stale=1; fi
-  if [ "$_lock_age" -gt 900 ]; then _stale=1; fi
-  if [ "$_stale" -eq 1 ]; then
-    echo "$(date '+%Y-%m-%d %H:%M:%S') STALE lock (pid=${_lock_pid:-none}, age=${_lock_age}s), removing" >> "$LOG"
-    rm -f "$LOCK"
-  else
-    echo "$(date '+%Y-%m-%d %H:%M:%S') SKIP overlap, lock held by pid $_lock_pid" >> "$LOG"
-    exit 0
+# acquire_lock: claim the run lock. Returns 0 if this run holds the
+# lock, 1 if a live lock already exists (caller skips the run).
+# The lock file holds the PID of the running watcher. A bare existence
+# check is not enough: if the process dies via SIGKILL or crashes, the
+# EXIT trap never runs and the lock stays, blocking every future run
+# forever. So the lock is validated, not just checked: it is stale if
+# its PID is gone, if the PID was reused by a different process, or if
+# it is older than 15 minutes (a single watcher run finishes in
+# minutes). A stale lock is removed and the run proceeds; a live lock
+# still skips the run.
+acquire_lock() {
+  if [ -e "$LOCK" ]; then
+    _lock_pid=$(cat "$LOCK" 2>/dev/null | tr -d ' \t\n')
+    _stale=0
+    if [ -z "$_lock_pid" ]; then _stale=1; fi
+    if [ "$_stale" -eq 0 ] && ! kill -0 "$_lock_pid" 2>/dev/null; then _stale=1; fi
+    if [ "$_stale" -eq 0 ] && ! ps -p "$_lock_pid" -o args= 2>/dev/null | grep -q "watcher"; then _stale=1; fi
+    # A lock older than 15 minutes is stale (find -mmin works on macOS
+    # and Linux, unlike stat -f %m which is BSD-only).
+    if [ -n "$(find "$LOCK" -mmin +15 2>/dev/null)" ]; then _stale=1; fi
+    if [ "$_stale" -eq 1 ]; then
+      echo "$(date '+%Y-%m-%d %H:%M:%S') STALE lock (pid=${_lock_pid:-none}), removing" >> "$LOG"
+      rm -f "$LOCK"
+    else
+      echo "$(date '+%Y-%m-%d %H:%M:%S') SKIP overlap, lock held by pid $_lock_pid" >> "$LOG"
+      return 1
+    fi
   fi
+  echo $$ > "$LOCK"
+  trap 'rm -f "$LOCK"' EXIT
+  return 0
+}
+
+# Prevent overlapping runs.
+if ! acquire_lock; then
+  exit 0
 fi
-echo $$ > "$LOCK"
-trap 'rm -f "$LOCK"' EXIT
 
 echo "=== $(date '+%Y-%m-%d %H:%M:%S') WAKE ===" >> "$LOG"
 

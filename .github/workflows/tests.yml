@@ -103,3 +103,17 @@ jobs:
             exit 1
           fi
           echo "README URLs are concrete."
+
+  behavioral:
+    # Behavioral tests for the ranking, memory and fallback logic.
+    # These run the actual watcher.sh functions (sourced, not executed)
+    # against synthetic data — no macOS, no model, no network.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install zsh
+        run: sudo apt-get install -y zsh
+
+      - name: behavioral tests (ranking, fallback, verify, filters, lock)
+        run: zsh tests/behavioral.sh

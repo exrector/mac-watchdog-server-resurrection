@@ -181,31 +181,55 @@ a significant one: it turns the system from a watchdog with a memory
 into an autonomous evolving system. That decision belongs to the human
 who owns the machine.
 
-## v1.1 — Evolution Engine (planned)
+## v1.1 — Adaptive Tool Evolution (planned)
 
-The next milestone: let the model not just answer "what to change?"
-but actually create, test, apply, and revise changes. The full cycle:
+The next milestone: the system improves by evolving its TOOL LIBRARY,
+not by rewriting itself. This is safer than self-modification of the
+running system: a new tool is ADDED alongside the old ones, and the
+statistics decide which one is preferred. Nothing that works is ever
+deleted or modified — it is only demoted.
 
-1. **Research** — identify a recurring failure or a deficiency in an
-   existing algorithm (from `incidents.log` and `hypotheses.tsv`).
-2. **Proposal** — design a new reflex, diagnostic check, or strategy
-   change (this is what `review.sh` already does, as proposals).
-3. **Experiment** — test the change against saved incidents and test
-   scenarios, in isolation, before it touches the live system.
-4. **Apply** — install the change automatically after the checks pass.
-5. **Observe** — measure recurrence count, recovery speed, and
-   regressions over the following cycles.
-6. **Decide** — keep the improvement, revise it, or roll it back.
+**The library.** Each reflex is a tool with an id, a version, a
+checksum, a run history, and an effectiveness score (`tools.tsv`,
+maintained by `watcher.sh` after every reflex run: runs, successes,
+total time, incident types). The five built-in reflexes are the initial
+tools, all in state `preferred`.
 
-Requirements for safe application: an independent controller (the
-kernel) that verifies the change, limits on what may be changed (the
-kernel itself is never touched), and guaranteed rollback to the last
-known-good version. The structured hypothesis memory (`hypotheses.tsv`)
-is the foundation: without persistent hypothesis IDs and refutation
-counters, the system cannot reliably know which of its ideas worked.
-Automatic creation of new reflexes from recurring incidents belongs
-here too — it is not implemented yet, and the README does not claim
-otherwise.
+**Lifecycle (four states).** A tool moves through:
+- `candidate` — the model created it as a separate script. Not yet
+  admitted to automatic repair.
+- `verified` — it passed independent checks (allowed actions only, no
+  violation of base constraints, no kernel access). The trust mark is
+  issued by the controller after verification, never by the model.
+- `preferred` — it showed the best results on a sufficient number of
+  COMPARABLE incidents (same incident type, enough samples — a
+  promotion needs a minimum sample size, not two lucky runs).
+- `retired` — no longer chosen by default, but preserved in the
+  library as a fallback.
+
+**Selection.** Priorities are data, not opinion: success rate AND
+recovery time AND side effects AND repeat-failure frequency, per
+incident type. A tool that is fast but causes repeat failures is worse
+than a slower one that holds.
+
+**Strategies.** The most interesting level: the model can improve not
+the tools but their COMBINATION — discovering that a certain sequence
+of existing tools restores the network more reliably than each action
+alone. A strategy is a new, named sequence of ready tools; the original
+tools stay unchanged. The system thus accumulates three kinds of
+experience: diagnostic (which symptoms mean which failure), practical
+(which tools actually help), and strategic (in what order and under
+what conditions to apply them).
+
+**Open problems (not solved yet).** How to admit a candidate tool
+safely: an experimental tool must not be tested on the real network
+connection of a remote Mac if it could cut off the only access channel.
+The admission checks (what a candidate must prove before it runs on a
+live failure) are the key unsolved piece, and the reason the model does
+not yet have write access to the tool library. The six-step cycle from
+the earlier Evolution Engine sketch (research → proposal → experiment
+→ apply → observe → decide) still applies; Adaptive Tool Evolution is
+the safer shape of it: evolve the library, not the system.
 
 ## What the reflexes repair
 

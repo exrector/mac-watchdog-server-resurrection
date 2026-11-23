@@ -59,6 +59,7 @@ export WATCHDOG_DIR
 LOG="$WATCHDOG_DIR/watcher.log"
 INCIDENTS="$WATCHDOG_DIR/incidents.log"
 EVENTS="$WATCHDOG_DIR/events.log"
+TOOLS="$WATCHDOG_DIR/tools.tsv"
 BLUEPRINT="$WATCHDOG_DIR/blueprint.md"
 AGENT="$WATCHDOG_DIR/recovery-agent"
 LOCK="$WATCHDOG_DIR/watcher.lock"
@@ -207,8 +208,10 @@ reflex_route() {
 }
 reflex_tailscale() {
   # "Logged out" needs the two-step re-login with the auth key; anything
-  # else (stopped/offline) just needs `tailscale up`.
+  # else (stopped/offline) just needs `tailscale up`. Records which one
+  # in REFLEX_TS_KIND, so the tool registry scores the right tool.
   if echo "$TS_STATUS" | grep -qi "logged out"; then
+    REFLEX_TS_KIND="login"
     echo "REFLEX tailscale: re-login (logged out)" >> "$LOG"
     _key=$(/bin/zsh "$WATCHDOG_DIR/lib/get-secret.sh" tailscale-authkey 2>/dev/null)
     if [ -z "$_key" ]; then
@@ -222,27 +225,96 @@ reflex_tailscale() {
     _rc2=$?
     REFLEX_LOG="$REFLEX_LOG tailscale-login(rc=$_rc1/$_rc2)"
   else
+    REFLEX_TS_KIND="up"
     echo "REFLEX tailscale: tailscale up" >> "$LOG"
     run_to 30 "$TAILSCALE_CLI" up >> "$LOG" 2>&1
     REFLEX_LOG="$REFLEX_LOG tailscale-up(rc=$?)"
   fi
 }
-# Run the reflex for every item in $BROKEN_ITEMS (array).
+# Run the reflex for every item in $BROKEN_ITEMS (array). Records each
+# reflex's duration in REFLEX_SECS and the items in REFLEXED_ITEMS, so
+# record_reflex_outcomes() can score them after the re-verify.
 run_reflexes() {
   REFLEX_LOG=""
+  REFLEXED_ITEMS=()
+  REFLEX_TS_KIND=""
+  local start end
   for item in "${BROKEN_ITEMS[@]}"; do
     case "$item" in
-      wifi) reflex_wifi ;;
-      dns) reflex_dns ;;
-      route) reflex_route ;;
-      tailscale) reflex_tailscale ;;
+      wifi|dns|route|tailscale)
+        REFLEXED_ITEMS+=("$item")
+        start=$(date +%s)
+        case "$item" in
+          wifi) reflex_wifi ;;
+          dns) reflex_dns ;;
+          route) reflex_route ;;
+          tailscale) reflex_tailscale ;;
+        esac
+        end=$(date +%s)
+        REFLEX_SECS[$item]=$((end - start))
+        ;;
       ping) echo "REFLEX ping: no direct reflex (ping is a symptom, not a cause — the other reflexes address it)" >> "$LOG" ;;
     esac
   done
   REFLEX_LOG="${REFLEX_LOG# }"
 }
 
-# --- Structured hypothesis memory (hypotheses.tsv). ---
+# --- Tool registry (tools.tsv) — the foundation of Adaptive Tool Evolution. ---
+# Each reflex is a tool. The registry records, per tool: how many times
+# it ran, how many times it fixed its item, and how long it took.
+# Columns (tab-separated):
+#   id, name, state, runs, successes, total_seconds, incident_types
+# States: candidate (created, not yet admitted), verified (passed
+# independent checks), preferred (best results on comparable incidents),
+# retired (kept in the library, no longer chosen by default). The five
+# built-in reflexes start as "preferred" — they are the current
+# defaults. A new tool is NEVER a modification of an existing one: it is
+# added alongside, and the statistics decide which one is preferred.
+# The trust mark (state) is issued by this script after verification,
+# never by the model itself.
+record_tool_run() {
+  # $1 = tool id, $2 = success (1/0), $3 = seconds, $4 = incident type
+  local id="$1" ok="$2" secs="$3" itype="$4"
+  if [ ! -f "$TOOLS" ]; then
+    printf 'id\tname\tstate\truns\tsuccesses\ttotal_seconds\tincident_types\n' > "$TOOLS"
+  fi
+  # Existence check via awk, not grep: grep's \t is not a tab in BSD
+  # grep (macOS), so `grep "^$id\t"` would never match and a duplicate
+  # row would be appended on every run. awk -F'\t' splits on real tabs.
+  if ! awk -F'\t' -v id="$id" '$1==id{found=1} END{exit !found}' "$TOOLS" 2>/dev/null; then
+    printf '%s\t%s\tpreferred\t0\t0\t0\t%s\n' "$id" "$id" "$itype" >> "$TOOLS"
+  fi
+  awk -F'\t' -v id="$id" -v ok="$ok" -v secs="$secs" -v itype="$itype" 'BEGIN{OFS="\t"} $1==id{$4=$4+1; $5=$5+ok; $6=$6+secs; if(index($7, itype)==0){if($7!="")$7=$7","; $7=$7 itype} print; next} {print}' "$TOOLS" > "$TOOLS.tmp" 2>/dev/null && mv "$TOOLS.tmp" "$TOOLS"
+}
+# After the re-verify, record the outcome of every reflex that fired.
+# An item is a success if it is NO LONGER in BROKEN_ITEMS; it is a
+# failure if it is still broken. REFLEX_SECS holds each reflex's
+# duration (seconds), REFLEXED_ITEMS the items that got a reflex.
+# REFLEX_TS_KIND is "up" or "login" for the Tailscale reflex.
+typeset -A REFLEX_SECS
+REFLEXED_ITEMS=()
+REFLEX_TS_KIND=""
+record_reflex_outcomes() {
+  local item tool_id ok secs
+  for item in "${REFLEXED_ITEMS[@]}"; do
+    secs="${REFLEX_SECS[$item]:-0}"
+    case "$item" in
+      wifi) tool_id="wifi-on" ;;
+      dns) tool_id="dns-reset" ;;
+      route) tool_id="route-add" ;;
+      tailscale)
+        if [ "$REFLEX_TS_KIND" = "login" ]; then tool_id="tailscale-login"; else tool_id="tailscale-up"; fi
+        ;;
+      *) continue ;;
+    esac
+    ok=1
+    for b in "${BROKEN_ITEMS[@]}"; do
+      if [ "$b" = "$item" ]; then ok=0; break; fi
+    done
+    record_tool_run "$tool_id" "$ok" "$secs" "$item"
+    echo "TOOL $tool_id: runs updated (success=$ok, ${secs}s)" >> "$LOG"
+  done
+}
 # incidents.log is free text — it cannot reliably enforce the rule
 # "after three refutations, stop proposing a hypothesis". This table
 # does. Columns (tab-separated):
@@ -384,8 +456,12 @@ echo "BROKEN items: $SYMPTOMS" >> "$LOG"
 # 2. Reflexes: deterministic repair for the known problems.
 run_reflexes
 
-# 3. Re-verify after the reflexes.
-if verify_health; then
+# 3. Re-verify after the reflexes. Score the tools first (success =
+# item no longer broken), whatever the overall outcome is.
+verify_health
+_reflex_rc=$?
+record_reflex_outcomes
+if [ "$_reflex_rc" -eq 0 ]; then
   echo "VERIFIED HEALTHY after reflexes" >> "$LOG"
   call_analyst "FIXED-BY-REFLEX" "$SYMPTOMS"
   echo "=== $(date '+%Y-%m-%d %H:%M:%S') DONE ===" >> "$LOG"

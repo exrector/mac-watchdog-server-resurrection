@@ -128,6 +128,33 @@ retired by the data, not by the model's memory. Turning a recurring
 problem into a NEW reflex is not automatic yet — that is the v1.1
 Evolution Engine (see below).
 
+**Facts and interpretations are kept separate.** `incidents.log` stores
+objective facts (symptoms, reflexes tried, outcome) recorded by the
+script; the model's analysis is clearly marked as its interpretation,
+never as a fact. `hypotheses.tsv` has an `evidence` column tying each
+hypothesis to the specific incidents that support it
+(`timestamp:symptoms`), so a hypothesis never becomes a fact just by
+being repeated.
+
+**Two-phase analysis.** The analyst works in two steps. Phase 1
+analyses ONLY the current incident (symptoms, reflexes, outcome,
+pre-failure events) — no history, no hypotheses — so a dominant old
+pattern cannot anchor it. Phase 2 then compares that preliminary
+conclusion against the history, but only against incidents with the
+SAME symptoms. A diagnostic experiment proved this matters: with a
+clean context the model still misattributed a Tailscale incident to
+DNS, so Phase 1 alone is not trusted either.
+
+**Deterministic verification of the cause.** After the model produces
+its hypothesis, the controller (not the model) checks it against the
+facts: the hypothesis must be about something that was actually broken
+in this incident. If it mentions only symptoms that were NOT broken,
+it is unsupported and recorded as `UNKNOWN` — the unsupported claim
+never inflates a hypothesis in the memory. Confidence is also capped
+by the data, not by the model's words: a first occurrence is always
+`HYPOTHESIS`, 2+ occurrences at most `PATTERN`, and `ESTABLISHED`
+needs a controlled check the model cannot do.
+
 The model's reasoning (every command it ran, its exit code and outcome)
 is saved to `last-reasoning.txt` after each run, so you can see exactly
 what it did and why.

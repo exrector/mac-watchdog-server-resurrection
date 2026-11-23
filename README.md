@@ -228,7 +228,7 @@ side effect — e.g. DNS recovering because Tailscale came back — is not
 credited to the tool that caused it; that is a known limitation.) The
 five built-in reflexes are the initial tools, all in state `preferred`.
 
-**Lifecycle (four states).** A tool moves through:
+**Lifecycle (three states).** A tool moves through:
 - `candidate` — the model created it as a separate script. Not yet
   admitted to automatic repair.
 - `verified` — it passed independent checks (allowed actions only, no
@@ -237,8 +237,12 @@ five built-in reflexes are the initial tools, all in state `preferred`.
 - `preferred` — it showed the best results on a sufficient number of
   COMPARABLE incidents (same incident type, enough samples — a
   promotion needs a minimum sample size, not two lucky runs).
-- `retired` — no longer chosen by default, but preserved in the
-  library as a fallback.
+
+Tools are never deleted or crossed out. A tool that is not preferred
+simply is not chosen, but it stays in the library with its history
+and can be preferred again later. The model stops using an old tool
+when a better one proves itself, but it does not forget it and does
+not rewrite anything.
 
 **Selection (implemented).** Priorities are data, not opinion. When a
 symptom is broken, the Watcher consults the registry and applies the
@@ -246,8 +250,9 @@ highest-scored tool for that symptom. The score is the smoothed
 success rate `(successes+1)/(runs+2)` — a new tool starts neutral at
 0.5 and a tool with more evidence wins over one with a single lucky
 run — plus a small state weight (preferred 3, verified 2, candidate
-1), with faster average time breaking ties. Retired tools are never
-selected. Proven on a real Mac: a Tailscale failure selected
+1), with faster average time breaking ties. Every tool in the registry
+stays eligible — none is ever deleted or crossed out, a tool simply is
+not chosen while its score is lower, and it can win again later. Proven on a real Mac: a Tailscale failure selected
 `tailscale-up` by its registry score (5/5) and recovered in 1s. With
 one tool per symptom today the choice is trivial; the mechanism is
 what matters — when a new tool is added for a symptom, the best one

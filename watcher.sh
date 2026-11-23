@@ -324,18 +324,19 @@ run_reflexes() {
 # (successes+1)/(runs+2) — Laplace smoothing, so a new tool starts at
 # a neutral 0.5 and a tool with more evidence wins over one with a
 # single lucky run — plus a small state weight (preferred 3, verified
-# 2, candidate 1), with faster average time breaking ties. Retired
-# tools are never selected. The tool with the highest score is the one
-# applied at the next failure for that symptom. A new tool is NEVER a
-# modification of an existing one: it is added alongside, and the
-# statistics decide which one is preferred. Returns the tool id, or
-# nothing if no tool in the registry handles this symptom.
+# 2, candidate 1), with faster average time breaking ties. Every tool
+# in the registry stays eligible — a tool is never deleted or crossed
+# out, it simply is not chosen while its score is lower, and it can win
+# again later if its record improves. The tool with the highest score
+# is the one applied at the next failure for that symptom. A new tool
+# is NEVER a modification of an existing one: it is added alongside,
+# and the statistics decide which one is preferred. Returns the tool
+# id, or nothing if no tool in the registry handles this symptom.
 select_tool_for_symptom() {
   local sym="$1"
   [ -f "$TOOLS" ] || return 1
   awk -F'\t' -v sym="$sym" '
     NR==1 { next }
-    $3 == "retired" { next }
     {
       n = split($7, types, ",")
       found = 0
@@ -359,8 +360,10 @@ select_tool_for_symptom() {
 # Columns (tab-separated):
 #   id, name, state, runs, successes, total_seconds, incident_types
 # States: candidate (created, not yet admitted), verified (passed
-# independent checks), preferred (best results on comparable incidents),
-# retired (kept in the library, no longer chosen by default). The five
+# independent checks), preferred (best results on comparable incidents).
+# Tools are never deleted or crossed out: a tool that is not preferred
+# simply is not chosen, but it stays in the library with its history
+# and can be preferred again later. The five
 # built-in reflexes start as "preferred" — they are the current
 # defaults. A new tool is NEVER a modification of an existing one: it is
 # added alongside, and the statistics decide which one is preferred.
@@ -499,9 +502,10 @@ verify_hypothesis() {
 # ranks them. The controller applies the proposal, with one safety
 # bound: a tool can only become `preferred` if it has 3+ runs and a
 # success rate of 0.8 or better. If the model proposes `preferred` for
-# a tool with insufficient evidence, it is capped at `verified`. A tool
-# the model marks `retired` is retired. The model decides the ranking;
-# the controller only enforces minimum evidence and records the facts.
+# a tool with insufficient evidence, it is capped at `verified`. The
+# model decides the ranking; the controller only enforces minimum
+# evidence and records the facts. Tools are never deleted or crossed
+# out — the model only changes their rank.
 # Format (one line per tool): TOOL-EVAL: <tool-id> | <state> | <reason>
 # The parser splits on "|" and trims, so extra "|" in the reason is kept.
 apply_tool_evals() {
@@ -515,7 +519,7 @@ apply_tool_evals() {
     reason=$(echo "$line" | awk -F'|' '{r=""; for(i=3;i<=NF;i++){if(r!="")r=r"|"; r=r $i} sub(/^[ \t]*REASON:[ \t]*/, "", r); gsub(/^[ \t]+|[ \t]+$/, "", r); print r}')
     [ -z "$tool_id" ] && continue
     case "$state" in
-      preferred|verified|candidate|retired) ;;
+      preferred|verified|candidate) ;;
       *) echo "TOOL-EVAL $tool_id: state '$state' is not valid, ignoring" >> "$LOG"; continue ;;
     esac
     if [ "$state" = "preferred" ]; then
@@ -645,7 +649,7 @@ call_analyst() {
     tools=$(cat "$TOOLS" 2>/dev/null)
   fi
   echo "--- analyst phase 2 (compare with history) ---" >> "$LOG"
-  local prompt2="You are the analyst for this Mac's watchdog. You have NO terminal and cannot run commands — analyse only. Preliminary conclusion for the CURRENT incident (symptoms: $symptoms, outcome: $outcome): $prelim. Now compare it with the history. Recent incident history with THE SAME SYMPTOMS (newest last): $history. Hypothesis table for THESE symptoms (id, occurrences, refutations, confidence, status, text, evidence): $hypotheses. If the history and the hypothesis table are EMPTY, there is no prior hypothesis to confirm or refute — write REFUTES: none and do not invent an id. Is the preliminary conclusion a repeat of an earlier incident WITH THE SAME SYMPTOMS? If yes, say which one and how many times, and confirm or upgrade the confidence (HYPOTHESIS -> PATTERN after 2+ same-symptom occurrences). If the preliminary conclusion does NOT match the history, say so — do not force it onto an old pattern. Was an earlier hypothesis confirmed or refuted by this incident (name its id)? REFUTES names an id ONLY when the new evidence CONTRADICTS that hypothesis, and the id must be one that appears in the hypothesis table above. If this incident CONFIRMS an earlier hypothesis (same cause again), write REFUTES: none. Answer the three questions: what broke, why does it keep happening, what should change so it does not happen again. Then evaluate the tools that ran in this incident (tools used: ${REFLEX_LOG:-none}). Evaluate ONLY those tools — do not evaluate tools that did not run. Tool registry (id, name, state, runs, successes, total_seconds, incident_types): $tools. For each tool that ran, judge it: did it fix its item well, was it the right tool, was it slow, did it cause harm? Propose its state: preferred (it worked well and should be the default for this symptom), verified (it worked but needs more evidence), candidate (untested or uncertain), or retired (it failed or caused harm). Output one line per tool you evaluated, each on its own line, in exactly this format with no labels: TOOL-EVAL: <tool-id> | <preferred|verified|candidate|retired> | <short reason>. Finish with two lines, each on its own line and nothing else on those lines: first HYPOTHESIS: <short cause text> | CONFIDENCE: <HYPOTHESIS or PATTERN or ESTABLISHED> | REFUTES: <id or none>, then ANSWER= followed by a short incident analysis (cause + confidence level + recurrence + recommendation). The REFUTES field holds ONLY an id from the table above or the word none — never prose, never the ANSWER text. Keep it under 12 lines."
+  local prompt2="You are the analyst for this Mac's watchdog. You have NO terminal and cannot run commands — analyse only. Preliminary conclusion for the CURRENT incident (symptoms: $symptoms, outcome: $outcome): $prelim. Now compare it with the history. Recent incident history with THE SAME SYMPTOMS (newest last): $history. Hypothesis table for THESE symptoms (id, occurrences, refutations, confidence, status, text, evidence): $hypotheses. If the history and the hypothesis table are EMPTY, there is no prior hypothesis to confirm or refute — write REFUTES: none and do not invent an id. Is the preliminary conclusion a repeat of an earlier incident WITH THE SAME SYMPTOMS? If yes, say which one and how many times, and confirm or upgrade the confidence (HYPOTHESIS -> PATTERN after 2+ same-symptom occurrences). If the preliminary conclusion does NOT match the history, say so — do not force it onto an old pattern. Was an earlier hypothesis confirmed or refuted by this incident (name its id)? REFUTES names an id ONLY when the new evidence CONTRADICTS that hypothesis, and the id must be one that appears in the hypothesis table above. If this incident CONFIRMS an earlier hypothesis (same cause again), write REFUTES: none. Answer the three questions: what broke, why does it keep happening, what should change so it does not happen again. Then evaluate the tools that ran in this incident (tools used: ${REFLEX_LOG:-none}). Evaluate ONLY those tools — do not evaluate tools that did not run. Tool registry (id, name, state, runs, successes, total_seconds, incident_types): $tools. For each tool that ran, judge it: did it fix its item well, was it the right tool, was it slow, did it cause harm? Propose its state: preferred (it worked well and should be the default for this symptom), verified (it worked but needs more evidence), or candidate (untested or uncertain). Tools are never deleted or crossed out — a tool that is not preferred simply is not chosen, but it stays in the library with its history and can be preferred again later. Output one line per tool you evaluated, each on its own line, in exactly this format with no labels: TOOL-EVAL: <tool-id> | <preferred|verified|candidate> | <short reason>. Finish with two lines, each on its own line and nothing else on those lines: first HYPOTHESIS: <short cause text> | CONFIDENCE: <HYPOTHESIS or PATTERN or ESTABLISHED> | REFUTES: <id or none>, then ANSWER= followed by a short incident analysis (cause + confidence level + recurrence + recommendation). The REFUTES field holds ONLY an id from the table above or the word none — never prose, never the ANSWER text. Keep it under 12 lines."
   local out
   out=$(run_to "$MODEL_TIMEOUT" "$AGENT" ask "$prompt2" 2>&1)
   local rc=$?

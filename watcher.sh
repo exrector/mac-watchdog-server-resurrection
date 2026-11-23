@@ -492,6 +492,40 @@ verify_hypothesis() {
   fi
   echo "$answer"
 }
+
+# Apply the model's tool evaluations (TOOL-EVAL lines) to the registry.
+# The model evaluates the tools that ran in this incident and proposes
+# their state — this is the model's job: it judges which tools work and
+# ranks them. The controller applies the proposal, with one safety
+# bound: a tool can only become `preferred` if it has 3+ runs and a
+# success rate of 0.8 or better. If the model proposes `preferred` for
+# a tool with insufficient evidence, it is capped at `verified`. A tool
+# the model marks `retired` is retired. The model decides the ranking;
+# the controller only enforces minimum evidence and records the facts.
+apply_tool_evals() {
+  local answer="$1"
+  local evals line tool_id state reason
+  evals=$(echo "$answer" | grep "^TOOL-EVAL:" 2>/dev/null)
+  [ -z "$evals" ] && return 0
+  echo "$evals" | while IFS= read -r line; do
+    tool_id=$(echo "$line" | sed 's/^TOOL-EVAL: *//; s/ *| STATE:.*//' | tr -d ' \t')
+    state=$(echo "$line" | sed 's/.*| STATE: *//; s/ *| REASON:.*//' | tr -d ' \t' | tr 'A-Z' 'a-z')
+    reason=$(echo "$line" | sed 's/.*| REASON: *//')
+    [ -z "$tool_id" ] && continue
+    case "$state" in
+      preferred|verified|candidate|retired) ;;
+      *) echo "TOOL-EVAL $tool_id: state '$state' is not valid, ignoring" >> "$LOG"; continue ;;
+    esac
+    if [ "$state" = "preferred" ]; then
+      if ! awk -F'\t' -v id="$tool_id" '$1==id && $4>=3 && $4>0 && $5/$4>=0.8{found=1} END{exit !found}' "$TOOLS" 2>/dev/null; then
+        echo "TOOL-EVAL $tool_id: preferred needs 3+ runs and >=0.8 success, capping at verified" >> "$LOG"
+        state="verified"
+      fi
+    fi
+    awk -F'\t' -v id="$tool_id" -v st="$state" 'BEGIN{OFS="\t"} $1==id{$3=st; print; next} {print}' "$TOOLS" > "$TOOLS.tmp" 2>/dev/null && mv "$TOOLS.tmp" "$TOOLS"
+    echo "TOOL-EVAL $tool_id -> $state ($reason)" >> "$LOG"
+  done
+}
 # --- Analyst: the model as investigator, not repairman. ---
 # After an incident (fixed by reflexes, fixed by the model, or gave up),
 # the model analyses WHAT happened and WHY, looks for patterns in the
@@ -604,8 +638,12 @@ call_analyst() {
   if [ -f "$HYPOTHESES" ]; then
     hypotheses=$(filter_hypotheses_by_symptoms "$HYPOTHESES" "$symptoms" 2>/dev/null)
   fi
+  local tools=""
+  if [ -f "$TOOLS" ]; then
+    tools=$(cat "$TOOLS" 2>/dev/null)
+  fi
   echo "--- analyst phase 2 (compare with history) ---" >> "$LOG"
-  local prompt2="You are the analyst for this Mac's watchdog. You have NO terminal and cannot run commands — analyse only. Preliminary conclusion for the CURRENT incident (symptoms: $symptoms, outcome: $outcome): $prelim. Now compare it with the history. Recent incident history with THE SAME SYMPTOMS (newest last): $history. Hypothesis table for THESE symptoms (id, occurrences, refutations, confidence, status, text, evidence): $hypotheses. If the history and the hypothesis table are EMPTY, there is no prior hypothesis to confirm or refute — write REFUTES: none and do not invent an id. Is the preliminary conclusion a repeat of an earlier incident WITH THE SAME SYMPTOMS? If yes, say which one and how many times, and confirm or upgrade the confidence (HYPOTHESIS -> PATTERN after 2+ same-symptom occurrences). If the preliminary conclusion does NOT match the history, say so — do not force it onto an old pattern. Was an earlier hypothesis confirmed or refuted by this incident (name its id)? REFUTES names an id ONLY when the new evidence CONTRADICTS that hypothesis, and the id must be one that appears in the hypothesis table above. If this incident CONFIRMS an earlier hypothesis (same cause again), write REFUTES: none. Answer the three questions: what broke, why does it keep happening, what should change so it does not happen again. Finish with two lines, each on its own line and nothing else on those lines: first HYPOTHESIS: <short cause text> | CONFIDENCE: <HYPOTHESIS or PATTERN or ESTABLISHED> | REFUTES: <id or none>, then ANSWER= followed by a short incident analysis (cause + confidence level + recurrence + recommendation). The REFUTES field holds ONLY an id from the table above or the word none — never prose, never the ANSWER text. Keep it under 10 lines."
+  local prompt2="You are the analyst for this Mac's watchdog. You have NO terminal and cannot run commands — analyse only. Preliminary conclusion for the CURRENT incident (symptoms: $symptoms, outcome: $outcome): $prelim. Now compare it with the history. Recent incident history with THE SAME SYMPTOMS (newest last): $history. Hypothesis table for THESE symptoms (id, occurrences, refutations, confidence, status, text, evidence): $hypotheses. If the history and the hypothesis table are EMPTY, there is no prior hypothesis to confirm or refute — write REFUTES: none and do not invent an id. Is the preliminary conclusion a repeat of an earlier incident WITH THE SAME SYMPTOMS? If yes, say which one and how many times, and confirm or upgrade the confidence (HYPOTHESIS -> PATTERN after 2+ same-symptom occurrences). If the preliminary conclusion does NOT match the history, say so — do not force it onto an old pattern. Was an earlier hypothesis confirmed or refuted by this incident (name its id)? REFUTES names an id ONLY when the new evidence CONTRADICTS that hypothesis, and the id must be one that appears in the hypothesis table above. If this incident CONFIRMS an earlier hypothesis (same cause again), write REFUTES: none. Answer the three questions: what broke, why does it keep happening, what should change so it does not happen again. Then evaluate the tools that ran in this incident (tools used: ${REFLEX_LOG:-none}). Tool registry (id, name, state, runs, successes, total_seconds, incident_types): $tools. For each tool that ran, judge it: did it fix its item well, was it the right tool, was it slow, did it cause harm? Propose its state: preferred (it worked well and should be the default for this symptom), verified (it worked but needs more evidence), candidate (untested or uncertain), or retired (it failed or caused harm). Output one line per tool you evaluated, each on its own line: TOOL-EVAL: <tool-id> | STATE: <preferred|verified|candidate|retired> | REASON: <short>. Finish with two lines, each on its own line and nothing else on those lines: first HYPOTHESIS: <short cause text> | CONFIDENCE: <HYPOTHESIS or PATTERN or ESTABLISHED> | REFUTES: <id or none>, then ANSWER= followed by a short incident analysis (cause + confidence level + recurrence + recommendation). The REFUTES field holds ONLY an id from the table above or the word none — never prose, never the ANSWER text. Keep it under 12 lines."
   local out
   out=$(run_to "$MODEL_TIMEOUT" "$AGENT" ask "$prompt2" 2>&1)
   local rc=$?
@@ -622,6 +660,11 @@ call_analyst() {
   verified_out=$(verify_hypothesis "$out" "$symptoms")
   # Update the structured hypothesis memory from the verified answer.
   record_hypothesis "$verified_out" "$symptoms"
+  # The model evaluates the tools that ran in this incident and proposes
+  # their states — this is the model's job: it judges which tools work
+  # and ranks them. The controller applies the proposal (with a minimum
+  # evidence bound) and records the facts.
+  apply_tool_evals "$out"
   # Record the incident: facts from the script + the model's analysis.
   {
     echo "=== $(date '+%Y-%m-%d %H:%M:%S') INCIDENT ==="

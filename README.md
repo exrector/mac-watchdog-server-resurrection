@@ -98,6 +98,10 @@ observer.sh (every minute, own LaunchAgent)
    └─ appends one line to events.log: the machine's state BEFORE any
       failure (Wi-Fi, IP, gateway, DNS, Tailscale, uptime). The analyst
       needs this "before" picture — without it, a cause is a guess.
+review.sh (once a day at 09:00, own LaunchAgent)
+   └─ the model reads the incident history and proposes improvements
+      (proposals.md). It does NOT apply them — applying is a separate,
+      human-approved step.
 watchdog-bootstrap.sh (every 5 min, from outside the watchdog dir)
    └─ restores any missing watchdog file from the backup copy
 ```
@@ -126,6 +130,55 @@ standing.
 The model's reasoning (every command it ran, its exit code and outcome)
 is saved to `last-reasoning.txt` after each run, so you can see exactly
 what it did and why.
+
+## Kernel vs evolution layer (self-improvement)
+
+The system is split in two, on purpose. The split is what makes
+self-improvement safe instead of suicidal.
+
+**Kernel (untouchable).** The minimal mechanism that keeps the machine
+reachable and recoverable: `watchdog-bootstrap.sh`, the backup copy of
+the files, `call-home.sh` (Plan B), and the version history. The model
+never changes the kernel. The kernel restores the last known-good
+snapshot when files are missing, and it is the only thing that can roll
+the evolution layer back. If the model could change the kernel, a bad
+change could cut off the machine with no way back. The kernel is
+protected (`chflags uchg`) and lives outside the watchdog directory.
+
+**Evolution layer (improvable).** Everything else: `watcher.sh`,
+`blueprint.md`, `observer.sh`, `review.sh`, the reflexes, the
+diagnostics. This is where improvements happen. The rules:
+
+- Every change is a Git commit in the watchdog directory, with a
+  message that says WHY (justification), what it is expected to achieve,
+  and how to verify it. No commit without a reason. (`install.sh`
+  initialises the Git repo; logs and the live config are ignored.)
+- A change is judged by TWO criteria: **safety** (did it break
+  anything) and **usefulness** (did the incident rate actually drop, or
+  the fix actually help). A change that breaks nothing but helps nothing
+  is a failed change — say so and revert it.
+- After a change, the system is observed for several cycles. If a
+  regression appears, revert to the previous commit. The backup copy is
+  updated (consolidated) only after a change has proven itself.
+- Changes that could cut off remote access (network, Tailscale, the
+  watcher itself) are never applied blindly: they are checked in
+  isolation first, and the kernel's rollback must be verified working
+  before the change goes in.
+
+**Daily review (initiative).** The system does not wait for a failure.
+Once a day at 09:00, `review.sh` calls the model with the incident
+history and asks what should improve — for example, "DNS was restored
+six times in seven days; the current strategy fixes the consequence,
+not the cause." The model writes proposals to `proposals.md`. It does
+NOT apply them. Applying a proposal is a separate, human-approved step:
+the model proposes, a human (or an explicit grant of authority) applies.
+
+**What is NOT yet enabled.** The model currently has no write access
+to the evolution layer — it proposes, it does not change code. Granting
+it the authority to apply its own proposals is a separate decision, and
+a significant one: it turns the system from a watchdog with a memory
+into an autonomous evolving system. That decision belongs to the human
+who owns the machine.
 
 ## What the reflexes repair
 
@@ -216,8 +269,9 @@ The installer:
    or root can remove the flag with `chflags nouchg`. Logs and the
    config stay writable.
 7. Installs and loads the LaunchAgents: `com.macwatchdog.watcher`,
-   `com.macwatchdog.bootstrap` and `com.macwatchdog.observer` (always),
-   plus `com.macwatchdog.call-home` only with `--with-call-home`.
+   `com.macwatchdog.bootstrap`, `com.macwatchdog.observer` and
+   `com.macwatchdog.review` (always), plus `com.macwatchdog.call-home`
+   only with `--with-call-home`.
 8. Runs `scripts/setup-secrets.sh` to store the sudo password and the
    Tailscale auth key (see Secrets below).
 

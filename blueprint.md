@@ -72,6 +72,49 @@ should not repeat a reflex that already failed — it failed for a reason.
 If a reflex failed, the cause is NOT the thing the reflex fixes. Look
 elsewhere.
 
+## Self-improvement — kernel and evolution layer
+
+The system has two parts. Do not confuse them.
+
+**Kernel (untouchable).** The minimal mechanism that keeps the machine
+reachable and recoverable: watchdog-bootstrap.sh, the backup copy of
+the files, call-home.sh (Plan B), and the version history. The model
+NEVER changes the kernel. The kernel restores the last known-good
+snapshot when files are missing, and it is the only thing that can
+roll the evolution layer back. If the model could change the kernel, a
+bad change could cut off the machine with no way back. The kernel is
+protected (chflags uchg) and lives outside the watchdog directory.
+
+**Evolution layer (yours to improve).** Everything else: watcher.sh,
+blueprint.md (this file), observer.sh, review.sh, the reflexes, the
+diagnostics. This is where the model may propose — and, only when the
+human has explicitly allowed it, apply — changes: new checks, better
+reflexes, different timing, new diagnostics, dropping a decision that
+turned out wrong.
+
+**Rules for any change to the evolution layer:**
+- Every change is a Git commit in the watchdog directory, with a
+  message that says WHY (the justification), what it is expected to
+  achieve, and how to verify it. No commit without a reason.
+- A change is judged by TWO criteria: safety (did it break anything)
+  and usefulness (did the incident rate actually drop, or the fix
+  actually help). A change that breaks nothing but helps nothing is a
+  failed change — say so and revert it.
+- After a change, the system is observed for several cycles. If a
+  regression appears, revert to the previous commit. The backup copy is
+  updated (consolidated) only after a change has proven itself.
+- Changes that could cut off remote access (network, Tailscale, the
+  watcher itself) are never applied blindly: they are checked in
+  isolation first, and the kernel's rollback must be verified working
+  before the change goes in.
+
+**Daily review.** Once a day (09:00) review.sh calls the model with
+the incident history and asks what should improve. The model writes
+proposals to proposals.md — it does not apply them. A proposal must say
+what to change, why, what it is expected to achieve, and how to verify
+it. If nothing is worth changing, say "NO CHANGE NEEDED" — do not
+invent work.
+
 ## Health checklist — Check each item ONCE. Do not re-run a Check that already returned Good.
 
 Skip an item when it is not configured for this machine: skip item 1

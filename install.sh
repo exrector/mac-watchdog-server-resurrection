@@ -159,10 +159,19 @@ chflags -R nouchg "$INSTALL_DIR" 2>/dev/null || true
 chflags -R nouchg "$BACKUP_DIR" 2>/dev/null || true
 
 # --- 3. Copy source files ---
-for f in watcher.sh blueprint.md reasoning.py click-allow.sh call-home.sh call-home-loop.sh watchdog-bootstrap.sh observer.sh watchdog.conf.example; do
+for f in watcher.sh blueprint.md reasoning.py click-allow.sh call-home.sh call-home-loop.sh watchdog-bootstrap.sh observer.sh review.sh watchdog.conf.example watchdog.gitignore; do
   cp "$SRC_DIR/$f" "$INSTALL_DIR/$f"
   cp "$SRC_DIR/$f" "$BACKUP_DIR/$f"
 done
+# The installed watchdog directory is the evolution layer: version it.
+# Every change to it is a Git commit with a justification, so a bad
+# change can be reverted. Logs and the live config are ignored.
+if command -v git >/dev/null 2>&1; then
+  cp "$SRC_DIR/watchdog.gitignore" "$INSTALL_DIR/.gitignore"
+  (cd "$INSTALL_DIR" && git init -q 2>/dev/null && git add -A 2>/dev/null \
+    && git -c user.name="Mac Watchdog" -c user.email="watchdog@localhost" \
+       commit -qm "Initial watchdog installation" 2>/dev/null) || true
+fi
 # The built recovery-agent binary (from the source build above).
 cp "$BUILT_AGENT" "$INSTALL_DIR/recovery-agent"
 cp "$BUILT_AGENT" "$BACKUP_DIR/recovery-agent"
@@ -244,7 +253,7 @@ fi
 # This is a speed bump, not a guarantee: the owner or root can remove
 # the flag with `chflags nouchg`. Logs stay writable.
 for d in "$INSTALL_DIR" "$BACKUP_DIR"; do
-  chflags uchg "$d/watcher.sh" "$d/blueprint.md" "$d/recovery-agent" "$d/reasoning.py" "$d/click-allow.sh" "$d/call-home.sh" "$d/call-home-loop.sh" "$d/watchdog-bootstrap.sh" "$d/observer.sh" "$d/lib/get-secret.sh" "$d/scripts/setup-secrets.sh" 2>/dev/null || true
+  chflags uchg "$d/watcher.sh" "$d/blueprint.md" "$d/recovery-agent" "$d/reasoning.py" "$d/click-allow.sh" "$d/call-home.sh" "$d/call-home-loop.sh" "$d/watchdog-bootstrap.sh" "$d/observer.sh" "$d/review.sh" "$d/lib/get-secret.sh" "$d/scripts/setup-secrets.sh" 2>/dev/null || true
 done
 chflags uchg "$SUPPORT_DIR/watchdog-bootstrap.sh" 2>/dev/null || true
 echo "Source files marked chflags uchg (immutable). Config and logs stay writable."
@@ -260,7 +269,7 @@ if [ "$DO_AGENTS" -eq 1 ]; then
   _ci="${CHECK_INTERVAL:-300}"
   _wd_esc=$(sed_escape "$WATCHDOG_DIR")
   _sup_esc=$(sed_escape "$SUPPORT_DIR")
-  _agents="watcher bootstrap observer"
+  _agents="watcher bootstrap observer review"
   if [ "$DO_CALL_HOME" -eq 1 ]; then
     _agents="$_agents call-home"
   fi

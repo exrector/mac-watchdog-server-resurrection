@@ -1,0 +1,12 @@
+# .gitignore for the installed watchdog directory (~/watchdog).
+# install.sh copies this file there as .gitignore and initialises a Git
+# repo, so every change to the evolution layer is a commit with a
+# justification, and a bad change can be reverted. Logs, the live config
+# and runtime data are never committed.
+*.log
+*.lock
+watchdog.conf
+last-reasoning.txt
+incidents.log
+events.log
+proposals.md

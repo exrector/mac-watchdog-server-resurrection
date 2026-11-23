@@ -39,7 +39,7 @@ mkdir -p "$WATCHDOG_DIR" 2>/dev/null
 # does NOT split a string on whitespace (unlike bash), so a plain string
 # would make the loop see one long name instead of many files and the
 # restore would silently do nothing. Always use "${FILES[@]}".
-FILES=(watcher.sh blueprint.md recovery-agent reasoning.py click-allow.sh call-home.sh call-home-loop.sh watchdog.conf observer.sh lib/get-secret.sh scripts/setup-secrets.sh)
+FILES=(watcher.sh blueprint.md recovery-agent reasoning.py click-allow.sh call-home.sh call-home-loop.sh watchdog.conf observer.sh review.sh lib/get-secret.sh scripts/setup-secrets.sh)
 # Source files get the user-immutable flag after restore (logs and the
 # config stay writable so the user can edit the config and the Watcher
 # can write logs).
@@ -69,7 +69,7 @@ done
 # load them (best effort). The bootstrap's own plist cannot reload itself
 # if it was removed — restoring the file is still useful; a reboot or a
 # manual `launchctl bootstrap` brings it back.
-PLISTS=(com.macwatchdog.watcher.plist com.macwatchdog.bootstrap.plist com.macwatchdog.observer.plist com.macwatchdog.call-home.plist)
+PLISTS=(com.macwatchdog.watcher.plist com.macwatchdog.bootstrap.plist com.macwatchdog.observer.plist com.macwatchdog.review.plist com.macwatchdog.call-home.plist)
 for p in "${PLISTS[@]}"; do
   if [ ! -e "$HOME/Library/LaunchAgents/$p" ] && [ -e "$BACKUP_DIR/launchagents/$p" ]; then
     cp -p "$BACKUP_DIR/launchagents/$p" "$HOME/Library/LaunchAgents/$p" 2>/dev/null

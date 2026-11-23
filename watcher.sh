@@ -529,7 +529,7 @@ verify_hypothesis() {
 # Format (one line per tool): TOOL-EVAL: <tool-id> | <state> | <reason>
 # The parser splits on "|" and trims, so extra "|" in the reason is kept.
 apply_tool_evals() {
-  local answer="$1"
+  local answer="$1" ran="$2"
   local evals line tool_id state reason
   evals=$(echo "$answer" | grep "^TOOL-EVAL:" 2>/dev/null)
   [ -z "$evals" ] && return 0
@@ -538,6 +538,12 @@ apply_tool_evals() {
     state=$(echo "$line" | awk -F'|' '{s=$2; sub(/^[ \t]*STATE:[ \t]*/, "", s); gsub(/^[ \t]+|[ \t]+$/, "", s); print tolower(s)}')
     reason=$(echo "$line" | awk -F'|' '{r=""; for(i=3;i<=NF;i++){if(r!="")r=r"|"; r=r $i} sub(/^[ \t]*REASON:[ \t]*/, "", r); gsub(/^[ \t]+|[ \t]+$/, "", r); print r}')
     [ -z "$tool_id" ] && continue
+    # Only tools that actually ran in this incident are evaluated.
+    # The model sometimes evaluates a tool that did not run — ignore it.
+    if ! echo " $ran " | grep -q " $tool_id "; then
+      echo "TOOL-EVAL $tool_id: did not run in this incident, ignoring" >> "$LOG"
+      continue
+    fi
     case "$state" in
       preferred|verified|candidate) ;;
       *) echo "TOOL-EVAL $tool_id: state '$state' is not valid, ignoring" >> "$LOG"; continue ;;

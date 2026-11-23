@@ -368,6 +368,13 @@ record_hypothesis() {
     HYPOTHESIS|PATTERN|ESTABLISHED) conf="$(echo "$conf" | tr 'a-z' 'A-Z')" ;;
     *) echo "HYPOTHESIS confidence '$conf' is not a level, using HYPOTHESIS" >> "$LOG"; conf="HYPOTHESIS" ;;
   esac
+  # Validate REFUTES: it must be a hypothesis id (H<number>) or "none".
+  # The model sometimes puts prose or the ANSWER text in this field —
+  # that is not an id, so it is ignored (treated as "none").
+  case "$refutes" in
+    none|H[0-9]*) ;;
+    *) echo "HYPOTHESIS REFUTES '$refutes' is not an id, ignoring" >> "$LOG"; refutes="none" ;;
+  esac
   now=$(date '+%Y-%m-%d %H:%M:%S')
   if [ ! -f "$HYPOTHESES" ]; then
     printf 'id\tfirst_seen\tlast_seen\toccurrences\trefutations\tconfidence\tstatus\ttext\tevidence\n' > "$HYPOTHESES"
@@ -385,15 +392,20 @@ record_hypothesis() {
     fi
   fi
   # 2. Same hypothesis as an existing active one: count the occurrence
-  # and append this incident to the evidence column.
+  # and append this incident to the evidence column. Cap the confidence
+  # by occurrences: a first occurrence is HYPOTHESIS, 2+ is at most
+  # PATTERN. ESTABLISHED needs a controlled check, which the model
+  # cannot do — the model claiming ESTABLISHED is downgraded to PATTERN.
   if awk -F'\t' -v txt="$text" 'NR>1 && index(tolower($8), tolower(txt))>0{found=1} END{exit !found}' "$HYPOTHESES" 2>/dev/null; then
-    awk -F'\t' -v txt="$text" -v now="$now" -v conf="$conf" -v ev="$now:$symptoms" 'BEGIN{OFS="\t"} NR>1 && index(tolower($8), tolower(txt))>0{$4=$4+1; $3=now; $6=conf; if($9!="")$9=$9","; $9=$9 ev; print; next} {print}' "$HYPOTHESES" > "$HYPOTHESES.tmp" 2>/dev/null && mv "$HYPOTHESES.tmp" "$HYPOTHESES"
+    awk -F'\t' -v txt="$text" -v now="$now" -v conf="$conf" -v ev="$now:$symptoms" 'BEGIN{OFS="\t"} NR>1 && index(tolower($8), tolower(txt))>0{$4=$4+1; $3=now; if($4<2){$6="HYPOTHESIS"} else if(conf=="ESTABLISHED"){$6="PATTERN"} else {$6=conf}; if($9!="")$9=$9","; $9=$9 ev; print; next} {print}' "$HYPOTHESES" > "$HYPOTHESES.tmp" 2>/dev/null && mv "$HYPOTHESES.tmp" "$HYPOTHESES"
     echo "HYPOTHESIS occurrence counted for: $text" >> "$LOG"
   else
-    # 3. New hypothesis: next id, with this incident as its first evidence.
+    # 3. New hypothesis: next id, with this incident as its first
+    # evidence. A first occurrence is always HYPOTHESIS, whatever the
+    # model claimed.
     local next_id
     next_id=$(awk -F'\t' 'NR>1 && $1 ~ /^H[0-9]+$/{n=substr($1,2)+0; if(n>m)m=n} END{print "H" (m+1)}' "$HYPOTHESES" 2>/dev/null)
-    printf '%s\t%s\t%s\t1\t0\t%s\tactive\t%s\t%s:%s\n' "$next_id" "$now" "$now" "$conf" "$text" "$now" "$symptoms" >> "$HYPOTHESES"
+    printf '%s\t%s\t%s\t1\t0\t%s\tactive\t%s\t%s:%s\n' "$next_id" "$now" "$now" "HYPOTHESIS" "$text" "$now" "$symptoms" >> "$HYPOTHESES"
     echo "HYPOTHESIS $next_id recorded: $text" >> "$LOG"
   fi
 }
@@ -542,7 +554,7 @@ call_analyst() {
     hypotheses=$(filter_hypotheses_by_symptoms "$HYPOTHESES" "$symptoms" 2>/dev/null)
   fi
   echo "--- analyst phase 2 (compare with history) ---" >> "$LOG"
-  local prompt2="You are the analyst for this Mac's watchdog. You have NO terminal and cannot run commands — analyse only. Preliminary conclusion for the CURRENT incident (symptoms: $symptoms, outcome: $outcome): $prelim. Now compare it with the history. Recent incident history with THE SAME SYMPTOMS (newest last): $history. Hypothesis table for THESE symptoms (id, occurrences, refutations, confidence, status, text, evidence): $hypotheses. Is the preliminary conclusion a repeat of an earlier incident WITH THE SAME SYMPTOMS? If yes, say which one and how many times, and confirm or upgrade the confidence (HYPOTHESIS -> PATTERN after 2+ same-symptom occurrences). If the preliminary conclusion does NOT match the history, say so — do not force it onto an old pattern. Was an earlier hypothesis confirmed or refuted by this incident (name its id)? REFUTES names an id ONLY when the new evidence CONTRADICTS that hypothesis. If this incident CONFIRMS an earlier hypothesis (same cause again), write REFUTES: none. Answer the three questions: what broke, why does it keep happening, what should change so it does not happen again. Finish with two lines: first HYPOTHESIS: <short cause text> | CONFIDENCE: <HYPOTHESIS or PATTERN or ESTABLISHED> | REFUTES: <id or none>, then ANSWER= followed by a short incident analysis (cause + confidence level + recurrence + recommendation). Keep it under 10 lines."
+  local prompt2="You are the analyst for this Mac's watchdog. You have NO terminal and cannot run commands — analyse only. Preliminary conclusion for the CURRENT incident (symptoms: $symptoms, outcome: $outcome): $prelim. Now compare it with the history. Recent incident history with THE SAME SYMPTOMS (newest last): $history. Hypothesis table for THESE symptoms (id, occurrences, refutations, confidence, status, text, evidence): $hypotheses. If the history and the hypothesis table are EMPTY, there is no prior hypothesis to confirm or refute — write REFUTES: none and do not invent an id. Is the preliminary conclusion a repeat of an earlier incident WITH THE SAME SYMPTOMS? If yes, say which one and how many times, and confirm or upgrade the confidence (HYPOTHESIS -> PATTERN after 2+ same-symptom occurrences). If the preliminary conclusion does NOT match the history, say so — do not force it onto an old pattern. Was an earlier hypothesis confirmed or refuted by this incident (name its id)? REFUTES names an id ONLY when the new evidence CONTRADICTS that hypothesis, and the id must be one that appears in the hypothesis table above. If this incident CONFIRMS an earlier hypothesis (same cause again), write REFUTES: none. Answer the three questions: what broke, why does it keep happening, what should change so it does not happen again. Finish with two lines, each on its own line and nothing else on those lines: first HYPOTHESIS: <short cause text> | CONFIDENCE: <HYPOTHESIS or PATTERN or ESTABLISHED> | REFUTES: <id or none>, then ANSWER= followed by a short incident analysis (cause + confidence level + recurrence + recommendation). The REFUTES field holds ONLY an id from the table above or the word none — never prose, never the ANSWER text. Keep it under 10 lines."
   local out
   out=$(run_to "$MODEL_TIMEOUT" "$AGENT" ask "$prompt2" 2>&1)
   local rc=$?

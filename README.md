@@ -245,19 +245,21 @@ when a better one proves itself, but it does not forget it and does
 not rewrite anything.
 
 **Selection (implemented).** Priorities are data, not opinion. When a
-symptom is broken, the Watcher consults the registry and applies the
-highest-scored tool for that symptom. The score is the smoothed
-success rate `(successes+1)/(runs+2)` — a new tool starts neutral at
-0.5 and a tool with more evidence wins over one with a single lucky
-run — plus a small state weight (preferred 3, verified 2), with faster
-average time breaking ties. Candidate tools are NOT in this selection:
-they run only as a last attempt (see below). Every tool in the registry
-stays eligible — none is ever deleted or crossed out, a tool simply is
-not chosen while its score is lower, and it can win again later. Proven on a real Mac: a Tailscale failure selected
-`tailscale-up` by its registry score (5/5) and recovered in 1s. With
-one tool per symptom today the choice is trivial; the mechanism is
-what matters — when a new tool is added for a symptom, the best one
-wins automatically.
+symptom is broken, the Watcher consults the registry and tries EVERY
+admitted tool for that symptom, best score first, until one fixes it.
+The score is the smoothed success rate `(successes+1)/(runs+2)` — a
+new tool starts neutral at 0.5 and a tool with more evidence wins over
+one with a single lucky run — plus a small state weight (preferred 3,
+verified 2), with faster average time breaking ties. A tool in
+cooldown (3 consecutive failures) is skipped for 24 hours. Candidate
+tools are NOT in this selection: they run only as a last attempt (see
+below). Every tool in the registry stays eligible — none is ever
+deleted or crossed out, a tool simply is not chosen while its score is
+lower, and it can win again later. Proven on a real Mac: a Tailscale
+failure selected `tailscale-up` by its registry score (5/5) and
+recovered in 1s. With one tool per symptom today the choice is
+trivial; the mechanism is what matters — when a new tool is added for
+a symptom, the best one wins automatically.
 
 **Strategies.** The most interesting level: the model can improve not
 the tools but their COMBINATION — discovering that a certain sequence
@@ -278,16 +280,26 @@ works from its own knowledge), and proposes NEW TOOLS for it — a
 better repair for a recurring failure, written as a script using only
 standard macOS tools. A deterministic installer extracts the proposal
 and registers the tool as a `candidate`: the model only writes text,
-the installer mechanically validates the id and the symptom, writes
-the script, and never overwrites an existing tool. The candidate then
+the installer mechanically validates the id and the symptom, checks
+the syntax (`zsh -n`) and a denylist of dangerous patterns
+(destructive deletion, piping downloaded code into a shell, disk
+writing/formatting, shutdown, unloading agents, fork bombs), writes
+the script, and never overwrites an existing tool. The sha256 of the
+installed script is recorded in tools-manifest.tsv (the version
+record); the watcher verifies the checksum before every run and
+refuses a script that changed after install. The candidate then
 gets its chance in the next real incident as a **last attempt**: after
 every admitted tool for the symptom failed, the best-ranked candidate
-runs (at most two per incident), and only independent verification of
+runs (at most two per incident, each under a 120s timeout that kills
+its whole process tree), and only independent verification of
 the fix counts toward its record. A candidate that fixes the symptom
 earns a success and can be promoted by the model's evaluation (capped
 by the controller's evidence thresholds: preferred needs 3+ runs and
 0.8 success); one that fails stays a candidate and is tried again next
-time — still only as a last attempt. The six-step cycle from the
+time — still only as a last attempt. After three consecutive failures
+a tool cools down for 24 hours instead of repeating forever. The
+library itself (tools/ plus the manifest) is backed up by the
+bootstrap and verified on restore. The six-step cycle from the
 earlier Evolution Engine sketch (research → proposal → experiment →
 apply → observe → decide) is now closed: research happens in idle
 time, the experiment is the last attempt in a real failure, and the
@@ -307,6 +319,29 @@ verify_hypothesis checks the first-mentioned symptom (the claimed
 cause), not just any keyword; review.sh receives the tool registry and
 attempt log and the blueprint section embedded in the prompt; and
 install.sh patches the bootstrap's default dir for `--dir` installs.
+
+**Audit fixes (v1.2.2, second ChatGPT review of v1.2.1).** The second
+audit found six issues; all were verified against the code and fixed
+(it also correctly counted 30 PASS lines in the v1.2.1 CI log, not 31
+as reported — the count was a reporting error, the tests themselves
+were green). The fixes: every tool now runs under a timeout
+(TOOL_TIMEOUT, 120s) that kills its whole process tree, so a hanging
+generated script cannot hang the watcher; the Watcher now tries EVERY
+admitted tool for a symptom, best first, before any candidate (before,
+only the best admitted tool was tried); the bootstrap backs up the
+whole tools/ library plus the manifest and the cooldown file, and
+verifies each restored script's checksum against the manifest (a
+mismatched script is not made executable); the installer checks a
+candidate's syntax (`zsh -n`) and a denylist of dangerous patterns,
+and records its sha256 in tools-manifest.tsv, which the watcher
+re-verifies before every run; the analyst now receives TOOL_RESULTS
+(each tool with its success and duration) in addition to REFLEX_LOG,
+so a candidate that fixed the network is visible by name; ping
+candidates now run (ping has no admitted reflex); tools.tsv writes are
+guarded by a registry lock shared by the watcher and the installer;
+the recorded duration includes the settle verification; and a tool
+with three consecutive failures cools down for 24 hours instead of
+repeating forever. The behavioral suite grew to 54 assertions.
 
 ## What the reflexes repair
 

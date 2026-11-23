@@ -48,6 +48,7 @@ INCIDENTS="$WATCHDOG_DIR/incidents.log"
 EVENTS="$WATCHDOG_DIR/events.log"
 TOOLS="$WATCHDOG_DIR/tools.tsv"
 ATTEMPTS="$WATCHDOG_DIR/tool-attempts.log"
+MANIFEST="$WATCHDOG_DIR/tools-manifest.tsv"
 PROPOSALS="$WATCHDOG_DIR/proposals.md"
 AGENT="$WATCHDOG_DIR/recovery-agent"
 BLUEPRINT="$WATCHDOG_DIR/blueprint.md"
@@ -116,6 +117,27 @@ research_query_for() {
   esac
 }
 
+# registry_lock / registry_unlock: the same lock as watcher.sh (the
+# two scripts are standalone, so the small implementation is duplicated
+# here). tools.tsv is written by the watcher on every tool run and by
+# this installer once a day; without a lock a read-modify-write in one
+# process can silently lose the other's change. Best-effort: if the
+# lock cannot be acquired in 10 seconds, the caller proceeds without
+# it and logs the fact.
+registry_lock() {
+  local lock="$WATCHDOG_DIR/.tools-lock" pid i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    if mkdir "$lock" 2>/dev/null; then echo $$ > "$lock/pid"; return 0; fi
+    pid=$(cat "$lock/pid" 2>/dev/null)
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then rm -rf "$lock"; continue; fi
+    if [ -n "$(find "$lock" -mmin +1 2>/dev/null)" ]; then rm -rf "$lock"; continue; fi
+    sleep 1
+  done
+  echo "REGISTRY LOCK: could not acquire after 10s, proceeding without lock" >> "$LOG"
+  return 0
+}
+registry_unlock() { rm -rf "$WATCHDOG_DIR/.tools-lock" 2>/dev/null; }
+
 # install_new_tools: deterministic installer for NEW-TOOL proposals.
 # The model only writes text (a proposal in proposals.md); this
 # function mechanically extracts it and registers the tool. It never
@@ -125,18 +147,34 @@ research_query_for() {
 #   SCRIPT:
 #   <zsh script, standard macOS tools only>
 #   END-SCRIPT
-# Validation (a proposal is untrusted text): the id must be lowercase
-# letters, digits and dashes (no path traversal, no spaces); the
-# symptom must be one of the known ones; the script must be non-empty
-# and at most 200 lines; an id that already exists (registry or file)
-# is skipped, never overwritten. The tool is registered as a candidate
-# in tools.tsv — it enters real repair only as a last attempt, after
-# every admitted tool failed (see watcher.sh).
+# Validation (a proposal is untrusted text — it may quote web results,
+# so the code is checked, not just the name):
+#   - the id must be lowercase letters, digits and dashes (no path
+#     traversal, no spaces);
+#   - the symptom must be one of the known ones;
+#   - the script must be non-empty and at most 200 lines;
+#   - the script must pass a syntax check (zsh -n) — a broken script
+#     is never installed;
+#   - the script must not contain a denylisted pattern (destructive
+#     deletion, piping downloaded code into a shell, disk writing,
+#     disk formatting, shutdown/reboot, unloading launch agents, fork
+#     bombs). This is a static best-effort scan, not a proof of safety
+#     — the runtime safeguards are the execution timeout, the
+#     integrity check before every run, and the independent
+#     verification of the fix;
+#   - an id that already exists (registry or file) is skipped, never
+#     overwritten.
+# The tool is registered as a candidate in tools.tsv, and its sha256,
+# install date, symptom and reason are recorded in tools-manifest.tsv
+# (the version record). It enters real repair only as a last attempt,
+# after every admitted tool failed (see watcher.sh).
 install_new_tools() {
   local proposals="$1" id sym reason script_file
   local tools_dir="$WATCHDOG_DIR/tools"
   mkdir -p "$tools_dir" 2>/dev/null
+  registry_lock
   [ -f "$TOOLS" ] || printf 'id\tname\tstate\truns\tsuccesses\ttotal_seconds\tincident_types\n' > "$TOOLS"
+  [ -f "$MANIFEST" ] || printf 'id\tsha256\tinstalled_at\tsymptom\treason\n' > "$MANIFEST"
   awk '
     /^NEW-TOOL:/ { in_block=1; header=$0; next }
     in_block && /^SCRIPT:/ { in_script=1; next }
@@ -167,6 +205,29 @@ install_new_tools() {
         if [ -f "$tools_dir/$id.sh" ] || awk -F'\t' -v id="$id" '$1==id{found=1} END{exit !found}' "$TOOLS" 2>/dev/null; then
           echo "INSTALL-TOOL: $id already exists, skipping (never overwritten)" >> "$LOG"; rm -f "$script_file"; continue
         fi
+        # Syntax check: a broken script is never installed.
+        if ! zsh -n "$script_file" 2>/dev/null; then
+          echo "INSTALL-TOOL: $id fails the syntax check, skipping" >> "$LOG"; rm -f "$script_file"; continue
+        fi
+        # Denylist: a static best-effort scan for the most dangerous
+        # patterns. A false positive (rejecting a safe tool) is
+        # acceptable; a false negative is what the runtime safeguards
+        # (execution timeout, integrity check, independent verification)
+        # are for. This is not a proof of safety.
+        _denied=""
+        for _pat in 'rm[[:space:]]+-rf[[:space:]]+(/|~|\$HOME|/\*)' \
+                    'rm[[:space:]]+--recursive[[:space:]]+--force[[:space:]]+(/|~|\$HOME)' \
+                    '\|[[:space:]]*(sh|bash|zsh|/bin/sh)([[:space:]]|$)' \
+                    ': *\(\) *\{ *: *\| *: *& *\} *; *:' \
+                    'dd[[:space:]]+if=' \
+                    'diskutil[[:space:]]+(erase|eraseDisk|eraseVolume)' \
+                    '^[[:space:]]*(sudo[[:space:]]+)?(shutdown|reboot|halt|poweroff)([[:space:]]|$)' \
+                    'launchctl[[:space:]]+(unload|remove|bootout)'; do
+          if grep -Eq "$_pat" "$script_file" 2>/dev/null; then _denied="$_pat"; break; fi
+        done
+        if [ -n "$_denied" ]; then
+          echo "INSTALL-TOOL: $id matches denylisted pattern '$_denied', skipping" >> "$LOG"; rm -f "$script_file"; continue
+        fi
         {
           echo "#!/bin/zsh"
           echo "# Candidate tool proposed by the daily reviewer on $(date '+%Y-%m-%d')."
@@ -178,12 +239,18 @@ install_new_tools() {
         } > "$tools_dir/$id.sh"
         chmod +x "$tools_dir/$id.sh"
         printf '%s\t%s\tcandidate\t0\t0\t0\t%s\n' "$id" "$id" "$sym" >> "$TOOLS"
+        # Version record: the checksum of what was installed, so the
+        # watcher can verify integrity before every run and the
+        # bootstrap can verify it on restore.
+        _sha=$(shasum -a 256 "$tools_dir/$id.sh" 2>/dev/null | awk '{print $1}')
+        printf '%s\t%s\t%s\t%s\t%s\n' "$id" "${_sha:-unknown}" "$(date '+%Y-%m-%d')" "$sym" "$reason" >> "$MANIFEST"
         echo "INSTALL-TOOL: $id (symptom $sym) installed as candidate" >> "$LOG"
         rm -f "$script_file"
         ;;
       *) printf '%s\n' "$line" >> "$script_file" ;;
     esac
   done
+  registry_unlock
 }
 
 # Nothing to review yet: no incidents recorded.

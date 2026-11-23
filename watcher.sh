@@ -51,6 +51,17 @@ MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"
 LOG_MAX_LINES="${LOG_MAX_LINES:-2000}"
 # How many recent incidents to show the analyst for pattern-spotting.
 INCIDENT_HISTORY_LINES="${INCIDENT_HISTORY_LINES:-80}"
+# Maximum seconds one tool may run (including its child processes).
+# A tool that hangs must not hang the watcher with it: run_to kills
+# the whole process tree after this many seconds and returns 124.
+# 120s is generous for a network repair (tailscale up takes seconds);
+# a tool that needs longer is a broken tool, not a slow one.
+TOOL_TIMEOUT="${TOOL_TIMEOUT:-120}"
+# Cooldown: after this many consecutive failures a tool is skipped for
+# COOLDOWN_SECONDS, so a broken tool does not repeat forever. It is
+# never deleted — it simply waits, and can win again later.
+COOLDOWN_FAILURES="${COOLDOWN_FAILURES:-3}"
+COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-86400}"
 
 # Tailscale is optional: if TAILSCALE_HOSTNAME is empty, the Tailscale
 # check is skipped (the machine is used without Tailscale).
@@ -61,6 +72,11 @@ INCIDENTS="$WATCHDOG_DIR/incidents.log"
 EVENTS="$WATCHDOG_DIR/events.log"
 TOOLS="$WATCHDOG_DIR/tools.tsv"
 ATTEMPTS="$WATCHDOG_DIR/tool-attempts.log"
+# Cooldown state: id, consecutive failures, last failure (epoch).
+COOLDOWN_FILE="$WATCHDOG_DIR/tools-cooldown.tsv"
+# Tool manifest: id, sha256, installed_at, symptom, reason. Written by
+# the reviewer installer; the bootstrap backs it up with the library.
+MANIFEST="$WATCHDOG_DIR/tools-manifest.tsv"
 BLUEPRINT="$WATCHDOG_DIR/blueprint.md"
 AGENT="$WATCHDOG_DIR/recovery-agent"
 LOCK="$WATCHDOG_DIR/watcher.lock"
@@ -117,6 +133,16 @@ echo "=== $(date '+%Y-%m-%d %H:%M:%S') WAKE ===" >> "$LOG"
 # Run a command with a hard timeout (seconds). Prints output, returns exit code.
 # macOS has no `timeout` command, so this runs the job in the background,
 # polls once a second, and kills it if it overruns. Returns 124 on timeout.
+# kill_tree: kill a process and all its descendants. Killing only the
+# direct child leaves orphaned children running (a hung curl, a
+# backgrounded waiter), which is exactly how a tool can hang the
+# watcher forever. pgrep -P exists on macOS and Linux.
+kill_tree() {
+  local pid="$1" child
+  for child in $(pgrep -P "$pid" 2>/dev/null); do kill_tree "$child"; done
+  kill -TERM "$pid" 2>/dev/null
+}
+
 run_to() {
   local secs="$1"; shift
   local out
@@ -126,7 +152,13 @@ run_to() {
   local i=0
   while kill -0 $pid 2>/dev/null; do
     if [ "$i" -ge "$secs" ]; then
-      kill -9 $pid 2>/dev/null
+      # Timeout: kill the whole process tree, not just the direct
+      # child — otherwise a hung grandchild keeps running and the
+      # watcher hangs with it. TERM first, then KILL the survivors.
+      kill_tree "$pid"
+      sleep 3
+      for child in $(pgrep -P "$pid" 2>/dev/null); do kill -KILL "$child" 2>/dev/null; done
+      kill -KILL "$pid" 2>/dev/null
       wait $pid 2>/dev/null
       cat "$out"
       rm -f "$out"
@@ -313,69 +345,103 @@ reflex_tailscale() {
 # with its timestamp, tool, incident symptoms, duration and outcome.
 # The aggregate (tools.tsv) is for ranking; the per-attempt log is the
 # raw history the analyst and the reviewer use to judge a tool.
+# run_one_tool <tool-id> <item>: run one tool, verify, record.
+# Returns 0 if the item recovered, 1 otherwise. The tool that actually
+# ran is recorded (for tailscale, the reflex may have done a login
+# instead of a plain up — REFLEX_TS_KIND decides, so its score is the
+# one updated). The duration INCLUDES the settle verification: the
+# speed rating must reflect how long the fix actually took to show, not
+# just how long the command ran. An external script runs under run_to
+# with TOOL_TIMEOUT (its whole process tree is killed on timeout) and
+# only if its checksum matches the install manifest. Every run is
+# appended to TOOL_RESULTS ("id:success=0/1,3s") so the analyst sees
+# exactly which tool did what — including candidates, whose scripts do
+# not write to REFLEX_LOG themselves.
+run_one_tool() {
+  local tool_id="$1" item="$2" start end secs ok rc
+  start=$(date +%s)
+  case "$tool_id" in
+    wifi-on) reflex_wifi ;;
+    dns-reset) reflex_dns ;;
+    route-add) reflex_route ;;
+    tailscale-up|tailscale-login) reflex_tailscale ;;
+    *)
+      if [ ! -x "$WATCHDOG_DIR/tools/$tool_id.sh" ]; then
+        echo "TOOL $tool_id: no implementation, skipping" >> "$LOG"
+        return 1
+      fi
+      if ! tool_integrity_ok "$tool_id"; then
+        echo "TOOL $tool_id: INTEGRITY MISMATCH (script changed after install), skipping" >> "$LOG"
+        return 1
+      fi
+      run_to "$TOOL_TIMEOUT" "$WATCHDOG_DIR/tools/$tool_id.sh" >> "$LOG" 2>&1
+      rc=$?
+      REFLEX_LOG="$REFLEX_LOG $tool_id(rc=$rc)"
+      if [ "$rc" -eq 124 ]; then
+        echo "TOOL $tool_id: TIMEOUT after ${TOOL_TIMEOUT}s (process tree killed)" >> "$LOG"
+      fi
+      ;;
+  esac
+  # For tailscale, the reflex may have done a login instead of a
+  # plain up (state decides: logged out needs a login). Record
+  # the tool that actually ran, so its score is the one updated.
+  if [ "$item" = "tailscale" ] && [ "$REFLEX_TS_KIND" = "login" ]; then tool_id="tailscale-login"; fi
+  # Verify with a settle grace period: the service needs a moment
+  # to come up after the reflex, and a single immediate check can
+  # falsely report failure.
+  if verify_item_settle "$item"; then ok=1; else ok=0; fi
+  end=$(date +%s)
+  secs=$((end - start))
+  record_tool_run "$tool_id" "$ok" "$secs" "$item"
+  RAN_TOOLS="$RAN_TOOLS $tool_id"
+  TOOL_RESULTS="$TOOL_RESULTS ${tool_id}:success=$ok,${secs}s"
+  echo "$(date '+%Y-%m-%d %H:%M:%S') $tool_id symptoms=$SYMPTOMS secs=$secs success=$ok" >> "$ATTEMPTS"
+  echo "TOOL $tool_id: success=$ok, ${secs}s" >> "$LOG"
+  [ "$ok" -eq 1 ]
+}
+
 run_reflexes() {
   REFLEX_LOG=""
   REFLEX_TS_KIND=""
   RAN_TOOLS=""
-  local start end secs item tool_id ok
+  TOOL_RESULTS=""
+  local item tool_id ok _tried _tried_any _cand
   for item in "${BROKEN_ITEMS[@]}"; do
     case "$item" in
       wifi|dns|route|tailscale)
-        # Select the tool by its registry score: the highest-scored
-        # IMPLEMENTED tool for this symptom is the one applied. The
-        # registry lists tools best-first (candidates excluded); the
-        # first one that is actually runnable wins. If a high-scored
-        # tool has no implementation, it is skipped and the next one
-        # is tried — a registered-but-unimplemented tool must never
-        # block the repair of its symptom. If the registry has no
-        # implemented tool for this symptom yet, fall back to the
+        # Try EVERY admitted tool for this symptom, best score first,
+        # until one fixes it. A registered-but-unimplemented tool or
+        # one in cooldown is skipped — it must never block the repair,
+        # and the next ranked tool gets its turn. If the registry has
+        # no implemented tool for this symptom yet, fall back to the
         # built-in default for it.
-        tool_id=""
+        ok=0
+        _tried_any=0
         for _cand in $(select_tool_for_symptom "$item" 2>/dev/null); do
-          if tool_is_implemented "$_cand"; then tool_id="$_cand"; break; fi
-          echo "TOOL-SELECT $item: $_cand has no implementation, trying next" >> "$LOG"
+          if ! tool_is_implemented "$_cand"; then
+            echo "TOOL-SELECT $item: $_cand has no implementation, trying next" >> "$LOG"
+            continue
+          fi
+          if tool_in_cooldown "$_cand"; then
+            echo "TOOL-SELECT $item: $_cand is in cooldown, skipping" >> "$LOG"
+            continue
+          fi
+          _tried_any=1
+          echo "TOOL-SELECT $item -> $_cand (by registry score)" >> "$LOG"
+          if run_one_tool "$_cand" "$item"; then ok=1; break; fi
         done
-        if [ -z "$tool_id" ]; then
+        if [ "$ok" -eq 0 ] && [ "$_tried_any" -eq 0 ]; then
           case "$item" in
             wifi) tool_id="wifi-on" ;;
             dns) tool_id="dns-reset" ;;
             route) tool_id="route-add" ;;
             tailscale) tool_id="tailscale-up" ;;
           esac
+          echo "TOOL-SELECT $item -> $tool_id (built-in default)" >> "$LOG"
+          if run_one_tool "$tool_id" "$item"; then ok=1; fi
         fi
-        echo "TOOL-SELECT $item -> $tool_id (by registry score)" >> "$LOG"
-        start=$(date +%s)
-        case "$tool_id" in
-          wifi-on) reflex_wifi ;;
-          dns-reset) reflex_dns ;;
-          route-add) reflex_route ;;
-          tailscale-up|tailscale-login) reflex_tailscale ;;
-          *) if [ -x "$WATCHDOG_DIR/tools/$tool_id.sh" ]; then
-               "$WATCHDOG_DIR/tools/$tool_id.sh" >> "$LOG" 2>&1
-             else
-               echo "TOOL $tool_id: no implementation, skipping" >> "$LOG"; continue
-             fi ;;
-        esac
-        # For tailscale, the reflex may have done a login instead of a
-        # plain up (state decides: logged out needs a login). Record
-        # the tool that actually ran, so its score is the one updated.
-        if [ "$item" = "tailscale" ] && [ "$REFLEX_TS_KIND" = "login" ]; then tool_id="tailscale-login"; fi
-        end=$(date +%s)
-        secs=$((end - start))
-        # Verify with a settle grace period: the service needs a moment
-        # to come up after the reflex, and a single immediate check can
-        # falsely report failure.
-        if verify_item_settle "$item"; then
-          ok=1
-        else
-          ok=0
-        fi
-        record_tool_run "$tool_id" "$ok" "$secs" "$item"
-        RAN_TOOLS="$RAN_TOOLS $tool_id"
-        echo "$(date '+%Y-%m-%d %H:%M:%S') $tool_id symptoms=$SYMPTOMS secs=$secs success=$ok" >> "$ATTEMPTS"
-        echo "TOOL $tool_id: success=$ok, ${secs}s" >> "$LOG"
         if [ "$ok" -eq 0 ]; then
-          # Last attempt (admission): the admitted tool failed. Now a
+          # Last attempt (admission): every admitted tool failed. Now a
           # candidate tool gets its chance — best first, at most two
           # per item per run. A candidate is new and unproven, so it
           # only runs when every admitted tool for this symptom failed.
@@ -395,36 +461,40 @@ run_reflexes() {
               echo "LAST-ATTEMPT $item: $_cand has no implementation, skipping" >> "$LOG"
               continue
             fi
+            if tool_in_cooldown "$_cand"; then
+              echo "LAST-ATTEMPT $item: $_cand is in cooldown, skipping" >> "$LOG"
+              continue
+            fi
             echo "LAST-ATTEMPT $item -> $_cand (candidate; admitted tools failed)" >> "$LOG"
-            start=$(date +%s)
-            case "$_cand" in
-              wifi-on) reflex_wifi ;;
-              dns-reset) reflex_dns ;;
-              route-add) reflex_route ;;
-              tailscale-up|tailscale-login) reflex_tailscale ;;
-              *) if [ -x "$WATCHDOG_DIR/tools/$_cand.sh" ]; then
-                   "$WATCHDOG_DIR/tools/$_cand.sh" >> "$LOG" 2>&1
-                 else
-                   echo "TOOL $_cand: no implementation, skipping" >> "$LOG"; continue
-                 fi ;;
-            esac
-            if [ "$item" = "tailscale" ] && [ "$REFLEX_TS_KIND" = "login" ]; then _cand="tailscale-login"; fi
-            end=$(date +%s)
-            secs=$((end - start))
-            if verify_item_settle "$item"; then ok=1; else ok=0; fi
-            record_tool_run "$_cand" "$ok" "$secs" "$item"
-            RAN_TOOLS="$RAN_TOOLS $_cand"
-            echo "$(date '+%Y-%m-%d %H:%M:%S') $_cand symptoms=$SYMPTOMS secs=$secs success=$ok" >> "$ATTEMPTS"
-            echo "LAST-ATTEMPT $_cand: success=$ok, ${secs}s" >> "$LOG"
+            if run_one_tool "$_cand" "$item"; then ok=1; break; fi
             _tried=$((_tried + 1))
-            [ "$ok" -eq 1 ] && break
           done
         fi
         ;;
-      ping) echo "REFLEX ping: no direct reflex (ping is a symptom, not a cause — the other reflexes address it)" >> "$LOG" ;;
+      ping)
+        # ping has no admitted reflex (it is a symptom, not a cause) —
+        # candidates are the only tools for it. They run here, best
+        # first, at most two per run.
+        _tried=0
+        for _cand in $(select_candidate_for_symptom ping 2>/dev/null); do
+          [ "$_tried" -ge 2 ] && break
+          if ! tool_is_implemented "$_cand"; then
+            echo "TOOL-SELECT ping: $_cand has no implementation, skipping" >> "$LOG"
+            continue
+          fi
+          if tool_in_cooldown "$_cand"; then
+            echo "TOOL-SELECT ping: $_cand is in cooldown, skipping" >> "$LOG"
+            continue
+          fi
+          echo "TOOL-SELECT ping -> $_cand (candidate; no admitted tool for ping)" >> "$LOG"
+          if run_one_tool "$_cand" ping; then break; fi
+          _tried=$((_tried + 1))
+        done
+        ;;
     esac
   done
   REFLEX_LOG="${REFLEX_LOG# }"
+  TOOL_RESULTS="${TOOL_RESULTS# }"
 }
 
 # --- Tool selection by score (Adaptive Tool Evolution, the ranking). ---
@@ -510,6 +580,63 @@ tool_is_implemented() {
   return 1
 }
 
+# --- Registry lock: tools.tsv is written by two processes. ---
+# The watcher updates the registry on every tool run; the reviewer
+# installer adds new tools once a day. Without a lock, a read-modify-
+# write in one process can silently lose the other's change. The lock
+# is a directory (mkdir is atomic) holding the owner's PID. It is
+# best-effort: if it cannot be acquired in 10 seconds, the caller
+# proceeds without it and logs the fact — a repair must never block on
+# a lock. Stale locks (dead PID, or older than 60s) are removed.
+registry_lock() {
+  local lock="$WATCHDOG_DIR/.tools-lock" pid i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    if mkdir "$lock" 2>/dev/null; then echo $$ > "$lock/pid"; return 0; fi
+    pid=$(cat "$lock/pid" 2>/dev/null)
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then rm -rf "$lock"; continue; fi
+    if [ -n "$(find "$lock" -mmin +1 2>/dev/null)" ]; then rm -rf "$lock"; continue; fi
+    sleep 1
+  done
+  echo "REGISTRY LOCK: could not acquire after 10s, proceeding without lock" >> "$LOG"
+  return 0
+}
+registry_unlock() { rm -rf "$WATCHDOG_DIR/.tools-lock" 2>/dev/null; }
+
+# --- Cooldown: a tool that fails repeatedly is skipped for a while. ---
+# After COOLDOWN_FAILURES consecutive failures the tool is not tried
+# for COOLDOWN_SECONDS. It is never deleted or crossed out — it simply
+# waits, and can win again later. The state lives in tools-cooldown.tsv
+# (id, consecutive failures, last failure epoch), updated by
+# record_tool_run. A tool with no row, or fewer failures than the
+# threshold, is not in cooldown.
+tool_in_cooldown() {
+  local id="$1" fails last now
+  [ -f "$COOLDOWN_FILE" ] || return 1
+  fails=$(awk -F'\t' -v id="$id" '$1==id{print $2}' "$COOLDOWN_FILE" 2>/dev/null)
+  last=$(awk -F'\t' -v id="$id" '$1==id{print $3}' "$COOLDOWN_FILE" 2>/dev/null)
+  [ -n "$fails" ] || return 1
+  [ "${fails:-0}" -ge "${COOLDOWN_FAILURES:-3}" ] || return 1
+  now=$(date +%s)
+  [ $((now - ${last:-0})) -lt "${COOLDOWN_SECONDS:-86400}" ]
+}
+
+# --- Tool integrity: a script runs only if it is what was installed. ---
+# The manifest (tools-manifest.tsv) records the sha256 of every tool
+# the installer registered. Before running an external script, its
+# current checksum is compared with the manifest. A mismatch means the
+# file changed after install — the tool is skipped and the mismatch is
+# logged, not executed. A tool with no manifest entry (installed before
+# the manifest existed, or added by hand) runs as before.
+tool_integrity_ok() {
+  local id="$1" want got
+  [ -f "$MANIFEST" ] || return 0
+  want=$(awk -F'\t' -v id="$id" '$1==id{print $2}' "$MANIFEST" 2>/dev/null)
+  [ -n "$want" ] || return 0
+  got=$(shasum -a 256 "$WATCHDOG_DIR/tools/$id.sh" 2>/dev/null | awk '{print $1}')
+  [ -n "$got" ] || return 1
+  [ "$got" = "$want" ]
+}
+
 # --- Tool registry (tools.tsv) — the foundation of Adaptive Tool Evolution. ---
 # Each reflex is a tool. The registry records, per tool: how many times
 # it ran, how many times it fixed its item, and how long it took.
@@ -528,6 +655,7 @@ tool_is_implemented() {
 record_tool_run() {
   # $1 = tool id, $2 = success (1/0), $3 = seconds, $4 = incident type
   local id="$1" ok="$2" secs="$3" itype="$4"
+  registry_lock
   if [ ! -f "$TOOLS" ]; then
     printf 'id\tname\tstate\truns\tsuccesses\ttotal_seconds\tincident_types\n' > "$TOOLS"
   fi
@@ -538,6 +666,23 @@ record_tool_run() {
     printf '%s\t%s\tpreferred\t0\t0\t0\t%s\n' "$id" "$id" "$itype" >> "$TOOLS"
   fi
   awk -F'\t' -v id="$id" -v ok="$ok" -v secs="$secs" -v itype="$itype" 'BEGIN{OFS="\t"} $1==id{$4=$4+1; $5=$5+ok; $6=$6+secs; if(index($7, itype)==0){if($7!="")$7=$7","; $7=$7 itype} print; next} {print}' "$TOOLS" > "$TOOLS.tmp" 2>/dev/null && mv "$TOOLS.tmp" "$TOOLS"
+  # Cooldown state: a success resets the failure streak; a failure
+  # extends it and stamps the time. The selector skips a tool whose
+  # streak reached the threshold until the cooldown expires.
+  if [ ! -f "$COOLDOWN_FILE" ]; then
+    printf 'id\tconsecutive_failures\tlast_failure\n' > "$COOLDOWN_FILE"
+  fi
+  local now=$(date +%s)
+  if [ "$ok" -eq 1 ]; then
+    awk -F'\t' -v id="$id" 'BEGIN{OFS="\t"} $1==id{$2=0; print; next} {print}' "$COOLDOWN_FILE" > "$COOLDOWN_FILE.tmp" 2>/dev/null && mv "$COOLDOWN_FILE.tmp" "$COOLDOWN_FILE"
+  else
+    if awk -F'\t' -v id="$id" '$1==id{found=1} END{exit !found}' "$COOLDOWN_FILE" 2>/dev/null; then
+      awk -F'\t' -v id="$id" -v now="$now" 'BEGIN{OFS="\t"} $1==id{$2=$2+1; $3=now; print; next} {print}' "$COOLDOWN_FILE" > "$COOLDOWN_FILE.tmp" 2>/dev/null && mv "$COOLDOWN_FILE.tmp" "$COOLDOWN_FILE"
+    else
+      printf '%s\t1\t%s\n' "$id" "$now" >> "$COOLDOWN_FILE"
+    fi
+  fi
+  registry_unlock
 }
 # --- Structured hypothesis memory (hypotheses.tsv). ---
 # "after three refutations, stop proposing a hypothesis". This table
@@ -684,6 +829,9 @@ apply_tool_evals() {
   local evals line tool_id state reason
   evals=$(echo "$answer" | grep "^TOOL-EVAL:" 2>/dev/null)
   [ -z "$evals" ] && return 0
+  # The whole update runs under the registry lock: the reviewer
+  # installer can add a tool while this rewrites the registry.
+  registry_lock
   echo "$evals" | while IFS= read -r line; do
     tool_id=$(echo "$line" | awk -F'|' '{s=$1; sub(/^TOOL-EVAL:[ \t]*/, "", s); gsub(/^[ \t]+|[ \t]+$/, "", s); print s}')
     state=$(echo "$line" | awk -F'|' '{s=$2; sub(/^[ \t]*STATE:[ \t]*/, "", s); gsub(/^[ \t]+|[ \t]+$/, "", s); print tolower(s)}')
@@ -708,6 +856,7 @@ apply_tool_evals() {
     awk -F'\t' -v id="$tool_id" -v st="$state" 'BEGIN{OFS="\t"} $1==id{$3=st; print; next} {print}' "$TOOLS" > "$TOOLS.tmp" 2>/dev/null && mv "$TOOLS.tmp" "$TOOLS"
     echo "TOOL-EVAL $tool_id -> $state ($reason)" >> "$LOG"
   done
+  registry_unlock
 }
 # --- Analyst: the model as investigator, not repairman. ---
 # After an incident (fixed by reflexes, fixed by the model, or gave up),
@@ -815,7 +964,7 @@ call_analyst() {
   # a clean context, so Phase 1 alone is not trusted either — Phase 2
   # and the deterministic verification below are the safety net.
   echo "--- analyst phase 1 (current incident only) ---" >> "$LOG"
-  local prompt1="You are the analyst for this Mac's watchdog. You have NO terminal and cannot run commands — analyse only. An incident just happened. SYMPTOMS (what was broken): $symptoms. Reflexes tried: ${REFLEX_LOG:-none}. Outcome: $outcome. State BEFORE the failure (observer, newest last): $events. Analyse ONLY this incident: what broke, and what most likely caused it. Use the symptoms and the pre-failure events. Do NOT invent history — there is none in this prompt. Label your cause assessment with exactly one of these three words — HYPOTHESIS, PATTERN or ESTABLISHED — never a number or a percentage. Finish with one line: HYPOTHESIS: <short cause text> | CONFIDENCE: <HYPOTHESIS or PATTERN or ESTABLISHED> | REFUTES: none. Keep it under 5 lines."
+  local prompt1="You are the analyst for this Mac's watchdog. You have NO terminal and cannot run commands — analyse only. An incident just happened. SYMPTOMS (what was broken): $symptoms. Reflexes tried: ${REFLEX_LOG:-none}. Tools run in this incident, with the result of each attempt: ${TOOL_RESULTS:-none}. Outcome: $outcome. State BEFORE the failure (observer, newest last): $events. Analyse ONLY this incident: what broke, and what most likely caused it. Use the symptoms and the pre-failure events. Do NOT invent history — there is none in this prompt. Label your cause assessment with exactly one of these three words — HYPOTHESIS, PATTERN or ESTABLISHED — never a number or a percentage. Finish with one line: HYPOTHESIS: <short cause text> | CONFIDENCE: <HYPOTHESIS or PATTERN or ESTABLISHED> | REFUTES: none. Keep it under 5 lines."
   local out1
   out1=$(run_to "$MODEL_TIMEOUT" "$AGENT" ask "$prompt1" 2>&1)
   local rc1=$?
@@ -841,7 +990,7 @@ call_analyst() {
     tools=$(cat "$TOOLS" 2>/dev/null)
   fi
   echo "--- analyst phase 2 (compare with history) ---" >> "$LOG"
-  local prompt2="You are the analyst for this Mac's watchdog. You have NO terminal and cannot run commands — analyse only. Preliminary conclusion for the CURRENT incident (symptoms: $symptoms, outcome: $outcome): $prelim. Now compare it with the history. Recent incident history with THE SAME SYMPTOMS (newest last): $history. Hypothesis table for THESE symptoms (id, occurrences, refutations, confidence, status, text, evidence): $hypotheses. If the history and the hypothesis table are EMPTY, there is no prior hypothesis to confirm or refute — write REFUTES: none and do not invent an id. Is the preliminary conclusion a repeat of an earlier incident WITH THE SAME SYMPTOMS? If yes, say which one and how many times, and confirm or upgrade the confidence (HYPOTHESIS -> PATTERN after 2+ same-symptom occurrences). If the preliminary conclusion does NOT match the history, say so — do not force it onto an old pattern. Was an earlier hypothesis confirmed or refuted by this incident (name its id)? REFUTES names an id ONLY when the new evidence CONTRADICTS that hypothesis, and the id must be one that appears in the hypothesis table above. If this incident CONFIRMS an earlier hypothesis (same cause again), write REFUTES: none. Answer the three questions: what broke, why does it keep happening, what should change so it does not happen again. Then evaluate the tools that ran in this incident (tools used: ${REFLEX_LOG:-none}). Evaluate ONLY those tools — do not evaluate tools that did not run. Tool registry (id, name, state, runs, successes, total_seconds, incident_types): $tools. For each tool that ran, judge it: did it fix its item well, was it the right tool, was it slow, did it cause harm? Propose its state: preferred (it worked well and should be the default for this symptom), verified (it worked but needs more evidence), or candidate (untested or uncertain). Tools are never deleted or crossed out — a tool that is not preferred simply is not chosen, but it stays in the library with its history and can be preferred again later. Output one line per tool you evaluated, each on its own line, in exactly this format with no labels: TOOL-EVAL: <tool-id> | <preferred|verified|candidate> | <short reason>. Finish with two lines, each on its own line and nothing else on those lines: first HYPOTHESIS: <short cause text> | CONFIDENCE: <HYPOTHESIS or PATTERN or ESTABLISHED> | REFUTES: <id or none>, then ANSWER= followed by a short incident analysis (cause + confidence level + recurrence + recommendation). The REFUTES field holds ONLY an id from the table above or the word none — never prose, never the ANSWER text. Keep it under 12 lines."
+  local prompt2="You are the analyst for this Mac's watchdog. You have NO terminal and cannot run commands — analyse only. Preliminary conclusion for the CURRENT incident (symptoms: $symptoms, outcome: $outcome): $prelim. Now compare it with the history. Recent incident history with THE SAME SYMPTOMS (newest last): $history. Hypothesis table for THESE symptoms (id, occurrences, refutations, confidence, status, text, evidence): $hypotheses. If the history and the hypothesis table are EMPTY, there is no prior hypothesis to confirm or refute — write REFUTES: none and do not invent an id. Is the preliminary conclusion a repeat of an earlier incident WITH THE SAME SYMPTOMS? If yes, say which one and how many times, and confirm or upgrade the confidence (HYPOTHESIS -> PATTERN after 2+ same-symptom occurrences). If the preliminary conclusion does NOT match the history, say so — do not force it onto an old pattern. Was an earlier hypothesis confirmed or refuted by this incident (name its id)? REFUTES names an id ONLY when the new evidence CONTRADICTS that hypothesis, and the id must be one that appears in the hypothesis table above. If this incident CONFIRMS an earlier hypothesis (same cause again), write REFUTES: none. Answer the three questions: what broke, why does it keep happening, what should change so it does not happen again. Then evaluate the tools that ran in this incident (tools used: ${REFLEX_LOG:-none}; results of each attempt: ${TOOL_RESULTS:-none}). Evaluate ONLY those tools — do not evaluate tools that did not run. Tool registry (id, name, state, runs, successes, total_seconds, incident_types): $tools. For each tool that ran, judge it: did it fix its item well, was it the right tool, was it slow, did it cause harm? Propose its state: preferred (it worked well and should be the default for this symptom), verified (it worked but needs more evidence), or candidate (untested or uncertain). Tools are never deleted or crossed out — a tool that is not preferred simply is not chosen, but it stays in the library with its history and can be preferred again later. Output one line per tool you evaluated, each on its own line, in exactly this format with no labels: TOOL-EVAL: <tool-id> | <preferred|verified|candidate> | <short reason>. Finish with two lines, each on its own line and nothing else on those lines: first HYPOTHESIS: <short cause text> | CONFIDENCE: <HYPOTHESIS or PATTERN or ESTABLISHED> | REFUTES: <id or none>, then ANSWER= followed by a short incident analysis (cause + confidence level + recurrence + recommendation). The REFUTES field holds ONLY an id from the table above or the word none — never prose, never the ANSWER text. Keep it under 12 lines."
   local out
   out=$(run_to "$MODEL_TIMEOUT" "$AGENT" ask "$prompt2" 2>&1)
   local rc=$?
@@ -868,6 +1017,7 @@ call_analyst() {
     echo "=== $(date '+%Y-%m-%d %H:%M:%S') INCIDENT ==="
     echo "SYMPTOMS: $symptoms"
     echo "REFLEXES: ${REFLEX_LOG:-none}"
+    echo "TOOL-RESULTS: ${TOOL_RESULTS:-none}"
     echo "OUTCOME: $outcome"
     echo "$verified_out" | grep -A 20 "^ANSWER=" | tail -n +2 | sed 's/^/ANALYSIS: /'
     echo "$verified_out" | grep "^HYPOTHESIS:" | head -1 | sed -E 's/(REFUTES: (none|H[0-9]+)).*/\1/' | sed 's/^/CAUSE: /'

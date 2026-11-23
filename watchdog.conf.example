@@ -86,3 +86,13 @@ EVENTS_MAX_LINES=2000
 # Log size control: when watcher.log exceeds this many lines, keep the
 # newest half. 0 disables trimming.
 LOG_MAX_LINES=2000
+# Maximum seconds one tool may run (including its child processes). A
+# tool that hangs is killed with its whole process tree and returns
+# 124. 120s is generous for a network repair; a tool that needs longer
+# is a broken tool, not a slow one.
+TOOL_TIMEOUT=120
+# Cooldown: after this many consecutive failures a tool is skipped for
+# COOLDOWN_SECONDS, so a broken tool does not repeat forever. It is
+# never deleted — it simply waits, and can win again later.
+COOLDOWN_FAILURES=3
+COOLDOWN_SECONDS=86400

@@ -25,6 +25,20 @@
 #      and its verified success is recorded.
 #  10. New-tool installer: a NEW-TOOL proposal is installed as a
 #      candidate; a bad id is rejected; re-installing is a no-op.
+#  11. All admitted tools first: when two admitted tools exist, both
+#      are tried before any candidate.
+#  12. Timeout: a hanging tool is killed with its process tree after
+#      TOOL_TIMEOUT and does not hang the watcher.
+#  13. Cooldown: three consecutive failures put a tool in cooldown; a
+#      success resets it.
+#  14. Installer code checks: a syntax error and a denylisted pattern
+#      are rejected; a valid tool is installed with a manifest row.
+#  15. Ping candidates: a candidate for ping runs (ping has no
+#      admitted reflex).
+#  16. Analyst input: TOOL_RESULTS lists each tool with its result.
+#  17. Timing: the recorded duration includes the settle verification.
+#  18. Registry lock: the lock is acquired and released; a stale lock
+#      is removed.
 #
 # Usage: zsh tests/behavioral.sh   (exit 0 = all pass, exit 1 = failure)
 
@@ -44,21 +58,30 @@ check() { # check <label> <expected> <actual>
 # --- Load the pure functions from watcher.sh (without running it). ---
 export WATCHDOG_DIR="$TMP/wd" TOOLS="$TMP/tools.tsv" LOG="$TMP/watcher.log"
 ATTEMPTS="$TMP/tool-attempts.log"
+COOLDOWN_FILE="$TMP/wd/tools-cooldown.tsv"
+MANIFEST="$TMP/wd/tools-manifest.tsv"
+TOOL_TIMEOUT="${TOOL_TIMEOUT:-120}"
+COOLDOWN_FAILURES="${COOLDOWN_FAILURES:-3}"
+COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-86400}"
 mkdir -p "$WATCHDOG_DIR" "$WATCHDOG_DIR/tools"
 : > "$LOG"; : > "$ATTEMPTS"
 for _fn in select_tool_for_symptom select_candidate_for_symptom \
-           tool_is_implemented verify_hypothesis \
+           tool_is_implemented tool_in_cooldown tool_integrity_ok \
+           registry_lock registry_unlock kill_tree run_to \
+           verify_hypothesis \
            apply_tool_evals filter_history_by_symptoms \
-           filter_hypotheses_by_symptoms record_tool_run run_reflexes; do
+           filter_hypotheses_by_symptoms record_tool_run run_one_tool run_reflexes; do
   _src=$(sed -n "/^$_fn()/,/^}/p" "$WATCHER")
   [ -n "$_src" ] || { echo "FAIL: function $_fn not found in watcher.sh"; exit 1; }
   eval "$_src"
 done
-# install_new_tools lives in review.sh.
+# install_new_tools lives in review.sh (with its own registry lock).
 REVIEW="$ROOT/review.sh"
-_src=$(sed -n '/^install_new_tools()/,/^}/p' "$REVIEW")
-[ -n "$_src" ] || { echo "FAIL: install_new_tools not found in review.sh"; exit 1; }
-eval "$_src"
+for _fn in registry_lock registry_unlock install_new_tools; do
+  _src=$(sed -n "/^$_fn()/,/^}/p" "$REVIEW")
+  [ -n "$_src" ] || { echo "FAIL: function $_fn not found in review.sh"; exit 1; }
+  eval "$_src"
+done
 
 # --- 1. Ranking. ---
 printf 'id\tname\tstate\truns\tsuccesses\ttotal_seconds\tincident_types\n' > "$TOOLS"
@@ -240,5 +263,183 @@ awk -F'\t' '$1=="etc-evil"{found=1} END{exit found?0:1}' "$TOOLS" && fail "insta
 install_new_tools "$TMP/proposals.md"
 _count=$(awk -F'\t' '$1=="dns-flush-plus"' "$TOOLS" | wc -l | tr -d ' ')
 check "installer: re-install is a no-op" "1" "$_count"
+
+# --- 11. All admitted tools first: A and B fail, C (candidate) runs. ---
+printf 'id\tname\tstate\truns\tsuccesses\ttotal_seconds\tincident_types\n' > "$TOOLS"
+printf 'tool-a\ttool-a\tpreferred\t10\t9\t10\ttailscale\n' >> "$TOOLS"
+printf 'tool-b\ttool-b\tverified\t5\t4\t5\ttailscale\n' >> "$TOOLS"
+printf 'tool-c\ttool-c\tcandidate\t0\t0\t0\ttailscale\n' >> "$TOOLS"
+for _t in tool-a tool-b; do
+  cat > "$WATCHDOG_DIR/tools/$_t.sh" <<'SH'
+#!/bin/zsh
+exit 0
+SH
+  chmod +x "$WATCHDOG_DIR/tools/$_t.sh"
+done
+cat > "$WATCHDOG_DIR/tools/tool-c.sh" <<'SH'
+#!/bin/zsh
+touch "$WATCHDOG_DIR/candidate-c-ran"
+SH
+chmod +x "$WATCHDOG_DIR/tools/tool-c.sh"
+# Admitted tools are builtins only in the dispatch; tool-a/tool-b are
+# external scripts, so they run via the generic branch. Verify fails
+# for the first two attempts, succeeds on the third (the candidate).
+_verify_n=0
+verify_item_settle() {
+  _verify_n=$((_verify_n + 1))
+  [ "$_verify_n" -ge 3 ]
+}
+BROKEN_ITEMS=(tailscale)
+SYMPTOMS="tailscale"
+REFLEX_TS_KIND=""
+run_reflexes
+_b_runs=$(awk -F'\t' '$1=="tool-b"{print $4}' "$TOOLS")
+_a_runs=$(awk -F'\t' '$1=="tool-a"{print $4}' "$TOOLS")
+check "all-admitted-first: first admitted tool was tried (10->11)" "11" "$_a_runs"
+check "all-admitted-first: second admitted tool was tried (5->6)" "6" "$_b_runs"
+[ -f "$WATCHDOG_DIR/candidate-c-ran" ] && pass "all-admitted-first: candidate ran only after both admitted failed" || fail "all-admitted-first: candidate did not run"
+_c_ok=$(awk -F'\t' '$1=="tool-c"{print $5}' "$TOOLS")
+check "all-admitted-first: candidate success recorded" "1" "$_c_ok"
+
+# --- 12. Timeout: a hanging tool is killed with its tree. ---
+TOOL_TIMEOUT=3
+printf 'id\tname\tstate\truns\tsuccesses\ttotal_seconds\tincident_types\n' > "$TOOLS"
+printf 'hang-tool\thang-tool\tcandidate\t0\t0\t0\ttailscale\n' >> "$TOOLS"
+cat > "$WATCHDOG_DIR/tools/hang-tool.sh" <<'SH'
+#!/bin/zsh
+sleep 60 &
+wait
+SH
+chmod +x "$WATCHDOG_DIR/tools/hang-tool.sh"
+# No admitted tool for tailscale in the registry, so the builtin
+# default would run first — remove it from the ranking by giving the
+# registry only the candidate, and stub the builtin to fail fast.
+printf 'id\tname\tstate\truns\tsuccesses\ttotal_seconds\tincident_types\n' > "$TOOLS"
+printf 'hang-tool\thang-tool\tcandidate\t0\t0\t0\ttailscale\n' >> "$TOOLS"
+reflex_tailscale() { :; }
+_verify_n=0
+verify_item_settle() { return 1; }
+BROKEN_ITEMS=(tailscale)
+SYMPTOMS="tailscale"
+REFLEX_TS_KIND=""
+_start=$(date +%s)
+run_reflexes
+_elapsed=$(( $(date +%s) - _start ))
+grep -q "TIMEOUT after 3s" "$LOG" && pass "timeout: hanging tool killed after TOOL_TIMEOUT" || fail "timeout: no TIMEOUT in log"
+[ "$_elapsed" -lt 20 ] && pass "timeout: watcher did not hang (took ${_elapsed}s)" || fail "timeout: watcher hung (${_elapsed}s)"
+_h_runs=$(awk -F'\t' '$1=="hang-tool"{print $4}' "$TOOLS")
+_h_ok=$(awk -F'\t' '$1=="hang-tool"{print $5}' "$TOOLS")
+check "timeout: hanging tool run recorded as failure" "1" "$_h_runs"
+check "timeout: hanging tool success is 0" "0" "$_h_ok"
+# No leftover sleep processes from the killed tree.
+pgrep -f "sleep 60" >/dev/null 2>&1 && fail "timeout: orphaned sleep process remains" || pass "timeout: no orphaned child processes"
+TOOL_TIMEOUT=120
+
+# --- 13. Cooldown: three failures cool down, a success resets. ---
+printf 'id\tname\tstate\truns\tsuccesses\ttotal_seconds\tincident_types\n' > "$TOOLS"
+rm -f "$COOLDOWN_FILE"
+record_tool_run cool-tool 0 1 tailscale
+record_tool_run cool-tool 0 1 tailscale
+tool_in_cooldown cool-tool && fail "cooldown: cooled down after 2 failures" || pass "cooldown: not cooled down after 2 failures"
+record_tool_run cool-tool 0 1 tailscale
+tool_in_cooldown cool-tool && pass "cooldown: cooled down after 3 failures" || fail "cooldown: not cooled down after 3 failures"
+record_tool_run cool-tool 1 1 tailscale
+tool_in_cooldown cool-tool && fail "cooldown: still cooled down after a success" || pass "cooldown: success resets the streak"
+
+# --- 14. Installer code checks: syntax, denylist, manifest. ---
+printf 'id\tname\tstate\truns\tsuccesses\ttotal_seconds\tincident_types\n' > "$TOOLS"
+rm -f "$MANIFEST"
+cat > "$TMP/proposals2.md" <<'EOF'
+NEW-TOOL: broken-syntax | dns | syntax error must be rejected
+SCRIPT:
+if [ -z "$x" ]; then
+  echo unclosed
+END-SCRIPT
+NEW-TOOL: pipe-to-shell | dns | piping remote code to a shell must be rejected
+SCRIPT:
+curl -s https://example.com/fix.sh | sh
+END-SCRIPT
+NEW-TOOL: good-tool | dns | valid tool
+SCRIPT:
+dscacheutil -flushcache
+END-SCRIPT
+EOF
+install_new_tools "$TMP/proposals2.md"
+awk -F'\t' '$1=="broken-syntax"{found=1} END{exit found?0:1}' "$TOOLS" && fail "installer-check: syntax error was installed" || pass "installer-check: syntax error rejected"
+awk -F'\t' '$1=="pipe-to-shell"{found=1} END{exit found?0:1}' "$TOOLS" && fail "installer-check: pipe-to-shell was installed" || pass "installer-check: pipe-to-shell rejected"
+_state=$(awk -F'\t' '$1=="good-tool"{print $3}' "$TOOLS")
+check "installer-check: valid tool installed as candidate" "candidate" "$_state"
+_msha=$(awk -F'\t' '$1=="good-tool"{print $2}' "$MANIFEST")
+_rsha=$(shasum -a 256 "$WATCHDOG_DIR/tools/good-tool.sh" 2>/dev/null | awk '{print $1}')
+check "installer-check: manifest checksum matches the installed script" "$_rsha" "$_msha"
+# Integrity: a modified script is refused at run time.
+echo "# tampered" >> "$WATCHDOG_DIR/tools/good-tool.sh"
+tool_integrity_ok good-tool && fail "integrity: tampered script passed" || pass "integrity: tampered script refused"
+
+# --- 15. Ping candidates run (ping has no admitted reflex). ---
+printf 'id\tname\tstate\truns\tsuccesses\ttotal_seconds\tincident_types\n' > "$TOOLS"
+printf 'ping-fix\tping-fix\tcandidate\t0\t0\t0\tping\n' >> "$TOOLS"
+cat > "$WATCHDOG_DIR/tools/ping-fix.sh" <<'SH'
+#!/bin/zsh
+touch "$WATCHDOG_DIR/ping-candidate-ran"
+SH
+chmod +x "$WATCHDOG_DIR/tools/ping-fix.sh"
+_verify_n=0
+verify_item_settle() {
+  _verify_n=$((_verify_n + 1))
+  [ "$_verify_n" -ge 1 ]
+}
+BROKEN_ITEMS=(ping)
+SYMPTOMS="ping"
+REFLEX_TS_KIND=""
+run_reflexes
+[ -f "$WATCHDOG_DIR/ping-candidate-ran" ] && pass "ping-candidate: candidate ran for ping" || fail "ping-candidate: candidate did not run for ping"
+
+# --- 16. Analyst input: TOOL_RESULTS lists each tool and its result. ---
+printf 'id\tname\tstate\truns\tsuccesses\ttotal_seconds\tincident_types\n' > "$TOOLS"
+printf 'tailscale-up\ttailscale-up\tpreferred\t10\t9\t10\ttailscale\n' >> "$TOOLS"
+printf 'tailscale-restart\ttailscale-restart\tcandidate\t0\t0\t0\ttailscale\n' >> "$TOOLS"
+cat > "$WATCHDOG_DIR/tools/tailscale-restart.sh" <<'SH'
+#!/bin/zsh
+touch "$WATCHDOG_DIR/candidate-ran"
+SH
+chmod +x "$WATCHDOG_DIR/tools/tailscale-restart.sh"
+reflex_tailscale() { :; }
+_verify_n=0
+verify_item_settle() {
+  _verify_n=$((_verify_n + 1))
+  [ "$_verify_n" -ge 2 ]
+}
+BROKEN_ITEMS=(tailscale)
+SYMPTOMS="tailscale"
+REFLEX_TS_KIND=""
+TOOL_RESULTS=""
+run_reflexes
+echo "$TOOL_RESULTS" | grep -q "tailscale-up:success=0" && pass "analyst-input: admitted tool result in TOOL_RESULTS" || fail "analyst-input: admitted tool result missing"
+echo "$TOOL_RESULTS" | grep -q "tailscale-restart:success=1" && pass "analyst-input: candidate result in TOOL_RESULTS" || fail "analyst-input: candidate result missing"
+
+# --- 17. Timing: the recorded duration includes the settle check. ---
+printf 'id\tname\tstate\truns\tsuccesses\ttotal_seconds\tincident_types\n' > "$TOOLS"
+printf 'tailscale-up\ttailscale-up\tpreferred\t10\t9\t10\ttailscale\n' >> "$TOOLS"
+reflex_tailscale() { :; }
+verify_item_settle() { sleep 2; return 0; }
+BROKEN_ITEMS=(tailscale)
+SYMPTOMS="tailscale"
+REFLEX_TS_KIND=""
+run_reflexes
+_secs=$(awk -F'\t' '$1=="tailscale-up"{print $6}' "$TOOLS")
+[ "${_secs:-0}" -ge 2 ] && pass "timing: recorded duration includes the settle check (${_secs}s)" || fail "timing: recorded duration is ${_secs}s, settle check not included"
+
+# --- 18. Registry lock: acquire, release, stale removal. ---
+registry_lock
+[ -d "$WATCHDOG_DIR/.tools-lock" ] && pass "registry-lock: lock acquired" || fail "registry-lock: lock not created"
+registry_unlock
+[ -d "$WATCHDOG_DIR/.tools-lock" ] && fail "registry-lock: lock not released" || pass "registry-lock: lock released"
+mkdir -p "$WATCHDOG_DIR/.tools-lock"
+echo "999999" > "$WATCHDOG_DIR/.tools-lock/pid"
+touch -t 202001010000 "$WATCHDOG_DIR/.tools-lock" 2>/dev/null || touch -d "2020-01-01" "$WATCHDOG_DIR/.tools-lock" 2>/dev/null
+registry_lock
+[ -d "$WATCHDOG_DIR/.tools-lock" ] && pass "registry-lock: stale lock removed and re-acquired" || fail "registry-lock: stale lock not handled"
+registry_unlock
 
 if [ "$FAIL" -eq 0 ]; then echo "ALL BEHAVIORAL TESTS PASSED"; exit 0; else echo "BEHAVIORAL TESTS FAILED"; exit 1; fi

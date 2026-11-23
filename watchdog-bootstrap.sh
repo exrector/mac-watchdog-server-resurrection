@@ -46,7 +46,13 @@ FILES=(watcher.sh blueprint.md recovery-agent reasoning.py click-allow.sh call-h
 # wipe restores the executables but loses everything the system learned
 # — its memory, statistics and priorities. The backup step below keeps
 # the backup copies current, so a restore brings back the latest state.
-MEMORY_FILES=(incidents.log hypotheses.tsv tools.tsv tool-attempts.log)
+MEMORY_FILES=(incidents.log hypotheses.tsv tools.tsv tool-attempts.log tools-manifest.tsv tools-cooldown.tsv)
+# The tool library: the executable scripts in tools/ are part of the
+# system's memory, not just its code. A candidate proposed by the
+# reviewer lives only here — the registry (tools.tsv) without the
+# scripts is a catalogue of tools that no longer exist. The library is
+# backed up as a whole, and on restore each script is verified against
+# the manifest (tools-manifest.tsv) by checksum.
 # Source files get the user-immutable flag after restore (logs and the
 # config stay writable so the user can edit the config and the Watcher
 # can write logs).
@@ -96,6 +102,84 @@ done
 # if it was removed — restoring the file is still useful; a reboot or a
 # manual `launchctl bootstrap` brings it back.
 PLISTS=(com.macwatchdog.watcher.plist com.macwatchdog.bootstrap.plist com.macwatchdog.observer.plist com.macwatchdog.review.plist com.macwatchdog.call-home.plist)
+
+# Tool library: back up the scripts in tools/ and restore them with a
+# checksum verification against the manifest. The library is small (a
+# handful of short scripts). Order matters:
+#   1. Verify the live library against the manifest FIRST. A script
+#      whose checksum does not match was changed after install — log it
+#      loudly and remove its executable bit. A mismatched script is
+#      never backed up and never executed.
+#   2. Back up only verified scripts (and scripts with no manifest
+#      entry, which predate the manifest or were added by hand).
+#   3. Restore a missing live library from the backup, then verify it.
+if [ -d "$WATCHDOG_DIR/tools" ] && [ -f "$WATCHDOG_DIR/tools-manifest.tsv" ]; then
+  while IFS= read -r _mline; do
+    case "$_mline" in
+      id*) continue ;;
+    esac
+    _mid=$(echo "$_mline" | awk -F'\t' '{print $1}')
+    _msha=$(echo "$_mline" | awk -F'\t' '{print $2}')
+    [ -n "$_mid" ] || continue
+    if [ -f "$WATCHDOG_DIR/tools/$_mid.sh" ]; then
+      _got=$(shasum -a 256 "$WATCHDOG_DIR/tools/$_mid.sh" 2>/dev/null | awk '{print $1}')
+      if [ "$_got" = "$_msha" ]; then
+        chmod +x "$WATCHDOG_DIR/tools/$_mid.sh" 2>/dev/null
+      else
+        chmod -x "$WATCHDOG_DIR/tools/$_mid.sh" 2>/dev/null
+        echo "$(date '+%Y-%m-%d %H:%M:%S') MANIFEST MISMATCH $_mid: script changed after install, not executable" >> "$LOG"
+      fi
+    else
+      echo "$(date '+%Y-%m-%d %H:%M:%S') MANIFEST MISSING $_mid: registered but no script" >> "$LOG"
+    fi
+  done < "$WATCHDOG_DIR/tools-manifest.tsv"
+fi
+if [ -d "$WATCHDOG_DIR/tools" ]; then
+  mkdir -p "$BACKUP_DIR/tools" 2>/dev/null
+  _backed_up=0
+  for _s in "$WATCHDOG_DIR/tools"/*.sh; do
+    [ -f "$_s" ] || continue
+    # Only verified scripts are backed up: a script that failed the
+    # manifest check above is non-executable and must not pollute the
+    # backup with a tampered copy.
+    if [ ! -x "$_s" ] && [ -f "$WATCHDOG_DIR/tools-manifest.tsv" ] && awk -F'\t' -v id="$(basename "$_s" .sh)" '$1==id{found=1} END{exit !found}' "$WATCHDOG_DIR/tools-manifest.tsv" 2>/dev/null; then
+      continue
+    fi
+    if [ ! -f "$BACKUP_DIR/tools/$(basename "$_s")" ] || ! cmp -s "$_s" "$BACKUP_DIR/tools/$(basename "$_s")"; then
+      cp -p "$_s" "$BACKUP_DIR/tools/" 2>/dev/null
+      _backed_up=1
+    fi
+  done
+  if [ "$_backed_up" -eq 1 ]; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') BACKED UP tools/ library" >> "$LOG"
+  fi
+fi
+if [ ! -d "$WATCHDOG_DIR/tools" ] && [ -d "$BACKUP_DIR/tools" ]; then
+  mkdir -p "$WATCHDOG_DIR/tools" 2>/dev/null
+  cp -R "$BACKUP_DIR/tools/." "$WATCHDOG_DIR/tools/" 2>/dev/null
+  echo "$(date '+%Y-%m-%d %H:%M:%S') RESTORED tools/ library from backup" >> "$LOG"
+  restored=1
+  # Verify what was just restored before it can run.
+  if [ -f "$WATCHDOG_DIR/tools-manifest.tsv" ]; then
+    while IFS= read -r _mline; do
+      case "$_mline" in
+        id*) continue ;;
+      esac
+      _mid=$(echo "$_mline" | awk -F'\t' '{print $1}')
+      _msha=$(echo "$_mline" | awk -F'\t' '{print $2}')
+      [ -n "$_mid" ] || continue
+      if [ -f "$WATCHDOG_DIR/tools/$_mid.sh" ]; then
+        _got=$(shasum -a 256 "$WATCHDOG_DIR/tools/$_mid.sh" 2>/dev/null | awk '{print $1}')
+        if [ "$_got" = "$_msha" ]; then
+          chmod +x "$WATCHDOG_DIR/tools/$_mid.sh" 2>/dev/null
+        else
+          chmod -x "$WATCHDOG_DIR/tools/$_mid.sh" 2>/dev/null
+          echo "$(date '+%Y-%m-%d %H:%M:%S') MANIFEST MISMATCH $_mid: restored script does not match manifest, not executable" >> "$LOG"
+        fi
+      fi
+    done < "$WATCHDOG_DIR/tools-manifest.tsv"
+  fi
+fi
 for p in "${PLISTS[@]}"; do
   if [ ! -e "$HOME/Library/LaunchAgents/$p" ] && [ -e "$BACKUP_DIR/launchagents/$p" ]; then
     cp -p "$BACKUP_DIR/launchagents/$p" "$HOME/Library/LaunchAgents/$p" 2>/dev/null

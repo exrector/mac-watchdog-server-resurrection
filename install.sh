@@ -155,7 +155,7 @@ echo
 # script itself also lives in SUPPORT_DIR for the same reason (see
 # watchdog-bootstrap.sh) — the LaunchAgent runs that copy.
 BACKUP_DIR="$SUPPORT_DIR/backup"
-mkdir -p "$INSTALL_DIR" "$BACKUP_DIR" "$INSTALL_DIR/lib" "$INSTALL_DIR/scripts" "$BACKUP_DIR/lib" "$BACKUP_DIR/scripts" "$BACKUP_DIR/launchagents" "$SUPPORT_DIR" 2>/dev/null
+mkdir -p "$INSTALL_DIR" "$BACKUP_DIR" "$INSTALL_DIR/lib" "$INSTALL_DIR/scripts" "$INSTALL_DIR/tools" "$BACKUP_DIR/lib" "$BACKUP_DIR/scripts" "$BACKUP_DIR/launchagents" "$SUPPORT_DIR" 2>/dev/null
 
 # Remove the immutable flag from existing files so the copy can overwrite
 # them (re-applied at the end). Ignore errors (files may not exist yet).

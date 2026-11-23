@@ -111,26 +111,30 @@ run_to() {
 }
 
 # Deterministic health verification. Prints one VERIFY line per item.
-# Sets BROKEN to a space-separated list of broken item names (empty when
+# Sets BROKEN_ITEMS to an array of broken item names (empty when
 # healthy) and TS_STATUS to the raw Tailscale status line (for the
 # reflex to tell "stopped" from "logged out"). Returns 0 only if all
 # enabled checks are OK. A check is skipped when its config is empty:
 # Wi-Fi is skipped when WIFI_INTERFACE is empty (Ethernet-only Mac),
 # Tailscale is skipped when TAILSCALE_HOSTNAME is empty (no Tailscale).
 # A skipped check is not a failure.
-BROKEN=""
+# NOTE (critical): BROKEN_ITEMS is an ARRAY. In zsh, `for item in
+# $BROKEN` with BROKEN="dns tailscale" iterates ONCE with the whole
+# string — the reflexes would silently never fire. Always iterate
+# "${BROKEN_ITEMS[@]}".
+BROKEN_ITEMS=()
 TS_STATUS=""
 verify_health() {
   local ok=1
   local wifi ping dns route ts
-  BROKEN=""
+  BROKEN_ITEMS=()
   TS_STATUS=""
   if [ -n "${WIFI_INTERFACE:-}" ]; then
     wifi=$(run_to 10 networksetup -getairportpower "$WIFI_INTERFACE" 2>&1)
     if echo "$wifi" | grep -q "On"; then
       echo "VERIFY wifi OK: $wifi" >> "$LOG"
     else
-      echo "VERIFY wifi BROKEN: $wifi" >> "$LOG"; ok=0; BROKEN="$BROKEN wifi"
+      echo "VERIFY wifi BROKEN: $wifi" >> "$LOG"; ok=0; BROKEN_ITEMS+=(wifi)
     fi
   else
     echo "VERIFY wifi SKIP (no WIFI_INTERFACE configured)" >> "$LOG"
@@ -139,26 +143,26 @@ verify_health() {
   if echo "$ping" | grep -q "1 packets received"; then
     echo "VERIFY ping OK" >> "$LOG"
   else
-    echo "VERIFY ping BROKEN: $ping" >> "$LOG"; ok=0; BROKEN="$BROKEN ping"
+    echo "VERIFY ping BROKEN: $ping" >> "$LOG"; ok=0; BROKEN_ITEMS+=(ping)
   fi
   dns=$(run_to 15 dig +short "$DNS_TEST_HOST" 2>&1)
   if echo "$dns" | grep -Eq "^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$"; then
     echo "VERIFY dns OK: $dns" >> "$LOG"
   else
-    echo "VERIFY dns BROKEN: $dns" >> "$LOG"; ok=0; BROKEN="$BROKEN dns"
+    echo "VERIFY dns BROKEN: $dns" >> "$LOG"; ok=0; BROKEN_ITEMS+=(dns)
   fi
   route=$(run_to 10 route -n get default 2>&1 | grep gateway)
   if [ -n "${EXPECTED_GATEWAY:-}" ]; then
     if echo "$route" | grep -q "$EXPECTED_GATEWAY"; then
       echo "VERIFY route OK: $route" >> "$LOG"
     else
-      echo "VERIFY route BROKEN: $route" >> "$LOG"; ok=0; BROKEN="$BROKEN route"
+      echo "VERIFY route BROKEN: $route" >> "$LOG"; ok=0; BROKEN_ITEMS+=(route)
     fi
   else
     if echo "$route" | grep -q "gateway:"; then
       echo "VERIFY route OK: $route" >> "$LOG"
     else
-      echo "VERIFY route BROKEN: $route" >> "$LOG"; ok=0; BROKEN="$BROKEN route"
+      echo "VERIFY route BROKEN: $route" >> "$LOG"; ok=0; BROKEN_ITEMS+=(route)
     fi
   fi
   if [ -n "${TAILSCALE_HOSTNAME:-}" ]; then
@@ -167,12 +171,11 @@ verify_health() {
     if echo "$ts" | grep -q "$TAILSCALE_HOSTNAME" && ! echo "$ts" | grep -Eqi "offline|stopped"; then
       echo "VERIFY tailscale OK: $ts" >> "$LOG"
     else
-      echo "VERIFY tailscale BROKEN: $ts" >> "$LOG"; ok=0; BROKEN="$BROKEN tailscale"
+      echo "VERIFY tailscale BROKEN: $ts" >> "$LOG"; ok=0; BROKEN_ITEMS+=(tailscale)
     fi
   else
     echo "VERIFY tailscale SKIP (no TAILSCALE_HOSTNAME configured)" >> "$LOG"
   fi
-  BROKEN="${BROKEN# }"
   return $((1 - ok))
 }
 
@@ -224,10 +227,10 @@ reflex_tailscale() {
     REFLEX_LOG="$REFLEX_LOG tailscale-up(rc=$?)"
   fi
 }
-# Run the reflex for every item in $BROKEN (space-separated).
+# Run the reflex for every item in $BROKEN_ITEMS (array).
 run_reflexes() {
   REFLEX_LOG=""
-  for item in $BROKEN; do
+  for item in "${BROKEN_ITEMS[@]}"; do
     case "$item" in
       wifi) reflex_wifi ;;
       dns) reflex_dns ;;
@@ -239,12 +242,62 @@ run_reflexes() {
   REFLEX_LOG="${REFLEX_LOG# }"
 }
 
+# --- Structured hypothesis memory (hypotheses.tsv). ---
+# incidents.log is free text — it cannot reliably enforce the rule
+# "after three refutations, stop proposing a hypothesis". This table
+# does. Columns (tab-separated):
+#   id, first_seen, last_seen, occurrences, refutations, confidence,
+#   status (active|refuted|established), text
+# The analyst's ANSWER must contain a line:
+#   HYPOTHESIS: <short text> | CONFIDENCE: <HYPOTHESIS|PATTERN|ESTABLISHED> | REFUTES: <id|none>
+# record_hypothesis() parses that line and updates the table. The next
+# analyst call receives the table, so it can reference hypothesis IDs
+# and see refutation counts instead of guessing from prose.
+HYPOTHESES="$WATCHDOG_DIR/hypotheses.tsv"
+record_hypothesis() {
+  local answer="$1" line text conf refutes now
+  line=$(echo "$answer" | grep "^HYPOTHESIS:" | head -1)
+  [ -z "$line" ] && return 0
+  text=$(echo "$line" | sed 's/^HYPOTHESIS: *//; s/ *| CONFIDENCE:.*//' | tr -d '\t' | sed 's/^ *//; s/ *$//')
+  conf=$(echo "$line" | sed 's/.*| CONFIDENCE: *//; s/ *| REFUTES:.*//' | tr -d ' \t')
+  refutes=$(echo "$line" | sed 's/.*| REFUTES: *//' | tr -d ' \t')
+  [ -z "$text" ] && return 0
+  [ -z "$conf" ] && conf="HYPOTHESIS"
+  now=$(date '+%Y-%m-%d %H:%M:%S')
+  if [ ! -f "$HYPOTHESES" ]; then
+    printf 'id\tfirst_seen\tlast_seen\toccurrences\trefutations\tconfidence\tstatus\ttext\n' > "$HYPOTHESES"
+  fi
+  # 1. A refutation: the new incident disproves an earlier hypothesis.
+  if [ -n "$refutes" ] && [ "$refutes" != "none" ]; then
+    awk -F'\t' -v id="$refutes" -v now="$now" 'BEGIN{OFS="\t"} $1==id{$5=$5+1; $3=now; if($5>=3)$7="refuted"; print; next} {print}' "$HYPOTHESES" > "$HYPOTHESES.tmp" 2>/dev/null && mv "$HYPOTHESES.tmp" "$HYPOTHESES"
+    echo "HYPOTHESIS $refutes refuted (refutations now $(awk -F'\t' -v id="$refutes" '$1==id{print $5}' "$HYPOTHESES"))" >> "$LOG"
+  fi
+  # 2. Same hypothesis as an existing active one: count the occurrence.
+  if awk -F'\t' -v txt="$text" 'NR>1 && index(tolower($8), tolower(txt))>0{found=1} END{exit !found}' "$HYPOTHESES" 2>/dev/null; then
+    awk -F'\t' -v txt="$text" -v now="$now" -v conf="$conf" 'BEGIN{OFS="\t"} NR>1 && index(tolower($8), tolower(txt))>0{$4=$4+1; $3=now; $6=conf; print; next} {print}' "$HYPOTHESES" > "$HYPOTHESES.tmp" 2>/dev/null && mv "$HYPOTHESES.tmp" "$HYPOTHESES"
+    echo "HYPOTHESIS occurrence counted for: $text" >> "$LOG"
+  else
+    # 3. New hypothesis: next id.
+    local next_id
+    next_id=$(awk -F'\t' 'NR>1 && $1 ~ /^H[0-9]+$/{n=substr($1,2)+0; if(n>m)m=n} END{print "H" (m+1)}' "$HYPOTHESES" 2>/dev/null)
+    printf '%s\t%s\t%s\t1\t0\t%s\tactive\t%s\n' "$next_id" "$now" "$now" "$conf" "$text" >> "$HYPOTHESES"
+    echo "HYPOTHESIS $next_id recorded: $text" >> "$LOG"
+  fi
+}
 # --- Analyst: the model as investigator, not repairman. ---
 # After an incident (fixed by reflexes, fixed by the model, or gave up),
 # the model analyses WHAT happened and WHY, looks for patterns in the
 # incident history, and the result is appended to incidents.log. The
 # model does NOT fix anything here — the fixing is already done (or has
 # failed). Its job is understanding and memory.
+#
+# READ-ONLY: the analyst runs in `ask` mode, which has NO terminal.
+# It cannot run commands, so it cannot repair anything even if it
+# wanted to — the "Do NOT run any repair commands" instruction is now
+# enforced by the tool, not by the prompt. All data it needs (symptoms,
+# reflexes, pre-failure events, incident history, hypothesis table) is
+# embedded in the prompt by this script. The repairman (escalation) is
+# the only role that gets the terminal, via `agent` mode.
 #
 # Three rules for the analysis (the analyst's job description):
 #   1. Use the PRE-FAILURE record. events.log (written by observer.sh
@@ -256,10 +309,12 @@ run_reflexes() {
 #      times with the same signature), ESTABLISHED (confirmed by a
 #      controlled check, or a permanent fix that held). Never present a
 #      hypothesis as an established cause.
-#   3. Judge your own past hypotheses. Check the previous incident's
-#      cause hypothesis against what happened this time. If it was
-#      wrong, say so explicitly — a refuted hypothesis is also
-#      knowledge, and it must lower that hypothesis's standing.
+#   3. Judge your own past hypotheses. The hypothesis table (below)
+#      lists earlier hypotheses with their refutation counts. Check the
+#      previous incident's cause hypothesis against what happened this
+#      time. If it was wrong, name its id in REFUTES — a refuted
+#      hypothesis is also knowledge. A hypothesis refuted three times
+#      is retired and must not be proposed again.
 # The analyst's three questions, in order: What broke? Why does it keep
 # happening? What should change so it does not happen again? The third
 # question is the point of the whole system.
@@ -267,23 +322,28 @@ run_reflexes() {
 #            $2 = symptoms (the BROKEN list at detection time).
 call_analyst() {
   local outcome="$1" symptoms="$2"
-  local history="" events=""
+  local history="" events="" hypotheses=""
   if [ -f "$INCIDENTS" ]; then
     history=$(tail -n "$INCIDENT_HISTORY_LINES" "$INCIDENTS" 2>/dev/null)
   fi
   if [ -f "$EVENTS" ]; then
     events=$(tail -n 30 "$EVENTS" 2>/dev/null)
   fi
-  local prompt="You are the analyst for this Mac's watchdog, not the repairman. Do NOT run any repair commands. Read the blueprint's Analyst section in $BLUEPRINT. An incident just happened. Symptoms: $symptoms. Reflexes tried: ${REFLEX_LOG:-none}. Outcome: $outcome. State BEFORE the failure (observer, newest last): $events. Recent incident history (newest last): $history. Analyse: what most likely caused this (use the pre-failure events, not just the symptoms), is it a repeat of an earlier incident (say which one and how many times), and was the previous incident's cause hypothesis confirmed or refuted by this one? Label your cause assessment HYPOTHESIS, PATTERN or ESTABLISHED. Answer the three questions: what broke, why does it keep happening, what should change so it does not happen again. Finish with ANSWER= followed by a short incident analysis (cause + confidence level + recurrence + recommendation). Keep it under 10 lines."
+  if [ -f "$HYPOTHESES" ]; then
+    hypotheses=$(cat "$HYPOTHESES" 2>/dev/null)
+  fi
+  local prompt="You are the analyst for this Mac's watchdog. You have NO terminal and cannot run commands — analyse only. An incident just happened. Symptoms: $symptoms. Reflexes tried: ${REFLEX_LOG:-none}. Outcome: $outcome. State BEFORE the failure (observer, newest last): $events. Recent incident history (newest last): $history. Hypothesis table (id, occurrences, refutations, confidence, status, text): $hypotheses. Analyse: what most likely caused this (use the pre-failure events, not just the symptoms), is it a repeat of an earlier incident (say which one and how many times), and was an earlier hypothesis confirmed or refuted by this one (name its id)? Label your cause assessment HYPOTHESIS, PATTERN or ESTABLISHED. Answer the three questions: what broke, why does it keep happening, what should change so it does not happen again. Finish with two lines: first HYPOTHESIS: <short cause text> | CONFIDENCE: <level> | REFUTES: <id or none>, then ANSWER= followed by a short incident analysis (cause + confidence level + recurrence + recommendation). Keep it under 10 lines."
   echo "--- analyst ---" >> "$LOG"
   local out
-  out=$(run_to "$MODEL_TIMEOUT" "$AGENT" agent "$prompt" 2>&1)
+  out=$(run_to "$MODEL_TIMEOUT" "$AGENT" ask "$prompt" 2>&1)
   local rc=$?
   if [ "$rc" -eq 124 ]; then
-    pkill -9 -f "recovery-agent agent" 2>/dev/null
+    pkill -9 -f "recovery-agent ask" 2>/dev/null
     echo "ANALYST TIMEOUT" >> "$LOG"
   fi
   echo "$out" >> "$LOG"
+  # Update the structured hypothesis memory from the analyst's answer.
+  record_hypothesis "$out"
   # Record the incident: facts from the script + the model's analysis.
   {
     echo "=== $(date '+%Y-%m-%d %H:%M:%S') INCIDENT ==="
@@ -291,6 +351,7 @@ call_analyst() {
     echo "REFLEXES: ${REFLEX_LOG:-none}"
     echo "OUTCOME: $outcome"
     echo "$out" | grep -A 20 "^ANSWER=" | sed 's/^/ANALYSIS: /'
+    echo "$out" | grep "^HYPOTHESIS:" | sed 's/^/CAUSE: /'
   } >> "$INCIDENTS"
   echo "INCIDENT recorded in $INCIDENTS" >> "$LOG"
 }
@@ -304,7 +365,7 @@ if [ "${1:-}" = "--dry-run" ]; then
     echo "DRY-RUN: HEALTHY — no repair needed, model would not be woken."
     exit 0
   else
-    echo "DRY-RUN: BROKEN ($BROKEN) — reflexes would fire, then the analyst. See VERIFY lines above."
+    echo "DRY-RUN: BROKEN (${(j: :)BROKEN_ITEMS}) — reflexes would fire, then the analyst. See VERIFY lines above."
     exit 1
   fi
 fi
@@ -317,7 +378,7 @@ if verify_health; then
   python3 "$WATCHDOG_DIR/reasoning.py" 2>/dev/null
   exit 0
 fi
-SYMPTOMS="$BROKEN"
+SYMPTOMS="${(j: :)BROKEN_ITEMS}"
 echo "BROKEN items: $SYMPTOMS" >> "$LOG"
 
 # 2. Reflexes: deterministic repair for the known problems.
@@ -331,7 +392,7 @@ if verify_health; then
   python3 "$WATCHDOG_DIR/reasoning.py" 2>/dev/null
   exit 0
 fi
-echo "STILL BROKEN after reflexes ($BROKEN) — escalating to the model" >> "$LOG"
+echo "STILL BROKEN after reflexes (${(j: :)BROKEN_ITEMS}) — escalating to the model" >> "$LOG"
 
 # 4. Escalation: reflexes failed, the problem is unknown. Only now does
 # the model act as repairman, up to MAX_ATTEMPTS, with independent

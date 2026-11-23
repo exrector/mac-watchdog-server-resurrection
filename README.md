@@ -114,18 +114,19 @@ not execute the routine fixes. What it is good at is reasoning about
 unfamiliar states, spotting patterns across incidents, and explaining
 what happened. That is its job here: analyst, not repairman.
 
-**Incident memory** (`incidents.log`) is what makes the system learn.
-Every incident is recorded with its symptoms, the reflexes tried, the
-outcome, and the model's analysis. The analysis answers three
-questions, in order: **What broke? Why does it keep happening? What
-should change so it does not happen again?** The third question is the
-point of the whole system. A problem seen three times and fixed the
-same way is a known problem — next time the reflex handles it without
-the model. The model reads the recent history on every call, so it can
-say "this DNS failure is the third this week" instead of starting from
-zero. It also judges its own past hypotheses: if a cause it proposed
-turns out wrong, that is recorded and lowers that hypothesis's
-standing.
+**Incident memory** (`incidents.log` + `hypotheses.tsv`) is what makes
+the system learn. Every incident is recorded with its symptoms, the
+reflexes tried, the outcome, and the model's analysis. The analysis
+answers three questions, in order: **What broke? Why does it keep
+happening? What should change so it does not happen again?** The third
+question is the point of the whole system. The model reads the recent
+history on every call, so it can say "this DNS failure is the third
+this week" instead of starting from zero. It also judges its own past
+hypotheses: `hypotheses.tsv` tracks each hypothesis with its
+occurrences and refutations, so a hypothesis refuted three times is
+retired by the data, not by the model's memory. Turning a recurring
+problem into a NEW reflex is not automatic yet — that is the v1.1
+Evolution Engine (see below).
 
 The model's reasoning (every command it ran, its exit code and outcome)
 is saved to `last-reasoning.txt` after each run, so you can see exactly
@@ -179,6 +180,32 @@ it the authority to apply its own proposals is a separate decision, and
 a significant one: it turns the system from a watchdog with a memory
 into an autonomous evolving system. That decision belongs to the human
 who owns the machine.
+
+## v1.1 — Evolution Engine (planned)
+
+The next milestone: let the model not just answer "what to change?"
+but actually create, test, apply, and revise changes. The full cycle:
+
+1. **Research** — identify a recurring failure or a deficiency in an
+   existing algorithm (from `incidents.log` and `hypotheses.tsv`).
+2. **Proposal** — design a new reflex, diagnostic check, or strategy
+   change (this is what `review.sh` already does, as proposals).
+3. **Experiment** — test the change against saved incidents and test
+   scenarios, in isolation, before it touches the live system.
+4. **Apply** — install the change automatically after the checks pass.
+5. **Observe** — measure recurrence count, recovery speed, and
+   regressions over the following cycles.
+6. **Decide** — keep the improvement, revise it, or roll it back.
+
+Requirements for safe application: an independent controller (the
+kernel) that verifies the change, limits on what may be changed (the
+kernel itself is never touched), and guaranteed rollback to the last
+known-good version. The structured hypothesis memory (`hypotheses.tsv`)
+is the foundation: without persistent hypothesis IDs and refutation
+counters, the system cannot reliably know which of its ideas worked.
+Automatic creation of new reflexes from recurring incidents belongs
+here too — it is not implemented yet, and the README does not claim
+otherwise.
 
 ## What the reflexes repair
 

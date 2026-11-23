@@ -50,19 +50,23 @@ if [ -f "$EVENTS" ]; then
   events=$(tail -n 60 "$EVENTS" 2>/dev/null)
 fi
 
-prompt="You are this Mac's self-improvement reviewer. Do NOT modify any files. Read the blueprint's Self-improvement section in $BLUEPRINT. Incident history (newest last): $history. Recent state events (newest last): $events. Look for patterns: a problem that recurs, a reflex that fires often, a fix that only treats symptoms, a hypothesis that turned out wrong. Propose up to 3 concrete improvements. Each proposal must say: what to change, why, what it is expected to achieve, and how to verify it (a concrete check). If nothing is worth changing, say so plainly — do not invent work. Finish with ANSWER= followed by the proposals, one per line, or 'NO CHANGE NEEDED'."
+prompt="You are this Mac's self-improvement reviewer. You have NO terminal and cannot run commands — analyse only. Read the blueprint's Self-improvement section in $BLUEPRINT. Incident history (newest last): $history. Recent state events (newest last): $events. Look for patterns: a problem that recurs, a reflex that fires often, a fix that only treats symptoms, a hypothesis that turned out wrong. Propose up to 3 concrete improvements. Each proposal must say: what to change, why, what it is expected to achieve, and how to verify it (a concrete check). If nothing is worth changing, say so plainly — do not invent work. Finish with ANSWER= followed by the proposals, one per line, or 'NO CHANGE NEEDED'."
 echo "--- review model call ---" >> "$LOG"
 
 # Reuse run_to from watcher.sh if available; otherwise a simple call.
 # (review.sh is standalone, so it defines its own minimal timeout.)
+# READ-ONLY: the reviewer runs in `ask` mode, which has NO terminal.
+# It cannot modify files — the "Do NOT modify any files" instruction is
+# enforced by the tool, not by the prompt. All data it needs is embedded
+# in the prompt by this script.
 out=$(mktemp /tmp/mac-watchdog-review.XXXXXX)
-"$AGENT" agent "$prompt" > "$out" 2>&1 &
+"$AGENT" ask "$prompt" > "$out" 2>&1 &
 pid=$!
 i=0
 while kill -0 $pid 2>/dev/null; do
   if [ "$i" -ge "$MODEL_TIMEOUT" ]; then
     kill -9 $pid 2>/dev/null
-    pkill -9 -f "recovery-agent agent" 2>/dev/null
+    pkill -9 -f "recovery-agent ask" 2>/dev/null
     echo "REVIEW MODEL TIMEOUT" >> "$LOG"
     break
   fi

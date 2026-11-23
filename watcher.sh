@@ -603,6 +603,12 @@ apply_tool_evals() {
 filter_history_by_symptoms() {
   local file="$1" symptoms="$2" maxlines="$3"
   [ -f "$file" ] || return 0
+  # Only facts are passed to the model: the incident header, symptoms,
+  # reflexes, outcome, and the verified cause. The model's own old
+  # prose (ANALYSIS: lines) is stripped — otherwise the model re-reads
+  # its own past conclusions as "history" and can anchor on a mistake
+  # it made months ago. That is how a model leads itself into a dead
+  # end: its past words become its future evidence.
   awk -v sym="$symptoms" -v max="$maxlines" '
     function flush() {
       if (block == "") return
@@ -612,6 +618,7 @@ filter_history_by_symptoms() {
       }
     }
     /^=== / { flush(); block = $0 "\n"; symline = ""; next }
+    /^ANALYSIS:/ { next }
     { block = block $0 "\n"; if ($1 == "SYMPTOMS:") symline = $0 }
     END { flush() }
   ' "$file" 2>/dev/null | tail -n "$maxlines"
@@ -625,8 +632,16 @@ filter_history_by_symptoms() {
 filter_hypotheses_by_symptoms() {
   local file="$1" symptoms="$2"
   [ -f "$file" ] || return 0
+  # Columns: id, first_seen, last_seen, occurrences, refutations,
+  # confidence, status, text, evidence. Header, then only the last 10
+  # live matching rows. Refuted hypotheses are not shown — they are old
+  # junk the model should not re-evaluate. Without a cap, the table
+  # grows forever and the model is fed an ever-longer list of stale
+  # guesses.
+  head -n 1 "$file" 2>/dev/null
   awk -F'\t' -v sym="$symptoms" '
-    NR==1 { print; next }
+    NR==1 { next }
+    $7 == "refuted" || $7 == "retired" { next }
     {
       n = split(sym, s, " ")
       low = tolower($8)
@@ -634,7 +649,7 @@ filter_hypotheses_by_symptoms() {
         if (index(low, tolower(s[i])) > 0) { print; next }
       }
     }
-  ' "$file" 2>/dev/null
+  ' "$file" 2>/dev/null | tail -n 10
 }
 call_analyst() {
   local outcome="$1" symptoms="$2"

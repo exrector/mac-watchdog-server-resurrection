@@ -275,16 +275,32 @@ run_reflexes() {
   for item in "${BROKEN_ITEMS[@]}"; do
     case "$item" in
       wifi|dns|route|tailscale)
+        # Select the tool by its registry score: the highest-scored
+        # tool for this symptom is the one applied. If the registry
+        # has no tool for this symptom yet, fall back to the built-in
+        # default for it.
+        tool_id=$(select_tool_for_symptom "$item")
+        if [ -z "$tool_id" ]; then
+          case "$item" in
+            wifi) tool_id="wifi-on" ;;
+            dns) tool_id="dns-reset" ;;
+            route) tool_id="route-add" ;;
+            tailscale) tool_id="tailscale-up" ;;
+          esac
+        fi
+        echo "TOOL-SELECT $item -> $tool_id (by registry score)" >> "$LOG"
         start=$(date +%s)
-        case "$item" in
-          wifi) reflex_wifi; tool_id="wifi-on" ;;
-          dns) reflex_dns; tool_id="dns-reset" ;;
-          route) reflex_route; tool_id="route-add" ;;
-          tailscale)
-            reflex_tailscale
-            if [ "$REFLEX_TS_KIND" = "login" ]; then tool_id="tailscale-login"; else tool_id="tailscale-up"; fi
-            ;;
+        case "$tool_id" in
+          wifi-on) reflex_wifi ;;
+          dns-reset) reflex_dns ;;
+          route-add) reflex_route ;;
+          tailscale-up|tailscale-login) reflex_tailscale ;;
+          *) echo "TOOL $tool_id: no implementation, skipping" >> "$LOG"; continue ;;
         esac
+        # For tailscale, the reflex may have done a login instead of a
+        # plain up (state decides: logged out needs a login). Record
+        # the tool that actually ran, so its score is the one updated.
+        if [ "$item" = "tailscale" ] && [ "$REFLEX_TS_KIND" = "login" ]; then tool_id="tailscale-login"; fi
         end=$(date +%s)
         secs=$((end - start))
         if verify_item "$item"; then
@@ -300,6 +316,41 @@ run_reflexes() {
     esac
   done
   REFLEX_LOG="${REFLEX_LOG# }"
+}
+
+# --- Tool selection by score (Adaptive Tool Evolution, the ranking). ---
+# Given a symptom, pick the tool with the highest score from the
+# registry (tools.tsv). The score is the smoothed success rate
+# (successes+1)/(runs+2) — Laplace smoothing, so a new tool starts at
+# a neutral 0.5 and a tool with more evidence wins over one with a
+# single lucky run — plus a small state weight (preferred 3, verified
+# 2, candidate 1), with faster average time breaking ties. Retired
+# tools are never selected. The tool with the highest score is the one
+# applied at the next failure for that symptom. A new tool is NEVER a
+# modification of an existing one: it is added alongside, and the
+# statistics decide which one is preferred. Returns the tool id, or
+# nothing if no tool in the registry handles this symptom.
+select_tool_for_symptom() {
+  local sym="$1"
+  [ -f "$TOOLS" ] || return 1
+  awk -F'\t' -v sym="$sym" '
+    NR==1 { next }
+    $3 == "retired" { next }
+    {
+      n = split($7, types, ",")
+      found = 0
+      for (i = 1; i <= n; i++) if (types[i] == sym) found = 1
+      if (!found) next
+      rate = ($5 + 1) / ($4 + 2)
+      w = ($3 == "preferred") ? 3 : ($3 == "verified") ? 2 : 1
+      avg = ($4 > 0) ? $6 / $4 : 0
+      score = rate * 100 + w
+      if (score > best_score || (score == best_score && avg < best_avg)) {
+        best_score = score; best_avg = avg; best_id = $1
+      }
+    }
+    END { if (best_id != "") print best_id }
+  ' "$TOOLS" 2>/dev/null
 }
 
 # --- Tool registry (tools.tsv) — the foundation of Adaptive Tool Evolution. ---

@@ -442,6 +442,26 @@ filter_history_by_symptoms() {
     END { flush() }
   ' "$file" 2>/dev/null | tail -n "$maxlines"
 }
+# Filter the hypothesis table to rows whose text mentions at least one
+# of the current symptoms (case-insensitive). Without this, a dominant
+# hypothesis (e.g. H1, DNS, 6 occurrences) anchors the analyst even
+# when the incident history is already filtered: the model latches onto
+# the most frequent hypothesis in the table regardless of the current
+# symptoms. The header row is always kept.
+filter_hypotheses_by_symptoms() {
+  local file="$1" symptoms="$2"
+  [ -f "$file" ] || return 0
+  awk -F'\t' -v sym="$symptoms" '
+    NR==1 { print; next }
+    {
+      n = split(sym, s, " ")
+      low = tolower($8)
+      for (i = 1; i <= n; i++) {
+        if (index(low, tolower(s[i])) > 0) { print; next }
+      }
+    }
+  ' "$file" 2>/dev/null
+}
 call_analyst() {
   local outcome="$1" symptoms="$2"
   local history="" events="" hypotheses=""
@@ -452,7 +472,7 @@ call_analyst() {
     events=$(tail -n 30 "$EVENTS" 2>/dev/null)
   fi
   if [ -f "$HYPOTHESES" ]; then
-    hypotheses=$(cat "$HYPOTHESES" 2>/dev/null)
+    hypotheses=$(filter_hypotheses_by_symptoms "$HYPOTHESES" "$symptoms" 2>/dev/null)
   fi
   local prompt="You are the analyst for this Mac's watchdog. You have NO terminal and cannot run commands — analyse only. An incident just happened. THE CURRENT INCIDENT'S SYMPTOMS ARE: $symptoms. Analyse THIS incident first — what broke here, and why. The incident history below is ONLY to check whether THESE SAME symptoms happened before; do NOT attribute this incident to a different symptom's pattern just because that pattern is frequent in the history. Reflexes tried: ${REFLEX_LOG:-none}. Outcome: $outcome. State BEFORE the failure (observer, newest last): $events. Recent incident history (newest last): $history. Hypothesis table (id, occurrences, refutations, confidence, status, text): $hypotheses. Analyse: what most likely caused this (use the pre-failure events, not just the symptoms), is it a repeat of an earlier incident WITH THE SAME SYMPTOMS (say which one and how many times), and was an earlier hypothesis confirmed or refuted by this one (name its id)? Label your cause assessment with exactly one of these three words — HYPOTHESIS, PATTERN or ESTABLISHED — never a number or a percentage. Answer the three questions: what broke, why does it keep happening, what should change so it does not happen again. Finish with two lines: first HYPOTHESIS: <short cause text> | CONFIDENCE: <HYPOTHESIS or PATTERN or ESTABLISHED> | REFUTES: <id or none>, then ANSWER= followed by a short incident analysis (cause + confidence level + recurrence + recommendation). REFUTES names an id ONLY when the new evidence CONTRADICTS that hypothesis. If this incident CONFIRMS an earlier hypothesis (same cause again), write REFUTES: none. Keep it under 10 lines."
   echo "--- analyst ---" >> "$LOG"

@@ -349,14 +349,28 @@ record_hypothesis() {
   refutes=$(echo "$line" | sed 's/.*| REFUTES: *//' | tr -d ' \t')
   [ -z "$text" ] && return 0
   [ -z "$conf" ] && conf="HYPOTHESIS"
+  # Normalise the confidence level: it must be one of the three words.
+  # The model sometimes answers with a number ("95") — a percentage is
+  # not an evidence level, so it falls back to HYPOTHESIS.
+  case "$(echo "$conf" | tr 'a-z' 'A-Z')" in
+    HYPOTHESIS|PATTERN|ESTABLISHED) conf="$(echo "$conf" | tr 'a-z' 'A-Z')" ;;
+    *) echo "HYPOTHESIS confidence '$conf' is not a level, using HYPOTHESIS" >> "$LOG"; conf="HYPOTHESIS" ;;
+  esac
   now=$(date '+%Y-%m-%d %H:%M:%S')
   if [ ! -f "$HYPOTHESES" ]; then
     printf 'id\tfirst_seen\tlast_seen\toccurrences\trefutations\tconfidence\tstatus\ttext\n' > "$HYPOTHESES"
   fi
   # 1. A refutation: the new incident disproves an earlier hypothesis.
+  # Guard: if the refuted id's text MATCHES the new hypothesis text, the
+  # model contradicted itself (it confirmed the very hypothesis it claims
+  # to refute). Skip the refutation — a match is a confirmation.
   if [ -n "$refutes" ] && [ "$refutes" != "none" ]; then
-    awk -F'\t' -v id="$refutes" -v now="$now" 'BEGIN{OFS="\t"} $1==id{$5=$5+1; $3=now; if($5>=3)$7="refuted"; print; next} {print}' "$HYPOTHESES" > "$HYPOTHESES.tmp" 2>/dev/null && mv "$HYPOTHESES.tmp" "$HYPOTHESES"
-    echo "HYPOTHESIS $refutes refuted (refutations now $(awk -F'\t' -v id="$refutes" '$1==id{print $5}' "$HYPOTHESES"))" >> "$LOG"
+    if awk -F'\t' -v id="$refutes" -v txt="$text" 'NR>1 && $1==id && index(tolower($8), tolower(txt))>0{found=1} END{exit !found}' "$HYPOTHESES" 2>/dev/null; then
+      echo "HYPOTHESIS $refutes NOT refuted: its text matches the new hypothesis (confirmation, not refutation)" >> "$LOG"
+    else
+      awk -F'\t' -v id="$refutes" -v now="$now" 'BEGIN{OFS="\t"} $1==id{$5=$5+1; $3=now; if($5>=3)$7="refuted"; print; next} {print}' "$HYPOTHESES" > "$HYPOTHESES.tmp" 2>/dev/null && mv "$HYPOTHESES.tmp" "$HYPOTHESES"
+      echo "HYPOTHESIS $refutes refuted (refutations now $(awk -F'\t' -v id="$refutes" '$1==id{print $5}' "$HYPOTHESES"))" >> "$LOG"
+    fi
   fi
   # 2. Same hypothesis as an existing active one: count the occurrence.
   if awk -F'\t' -v txt="$text" 'NR>1 && index(tolower($8), tolower(txt))>0{found=1} END{exit !found}' "$HYPOTHESES" 2>/dev/null; then
@@ -418,7 +432,7 @@ call_analyst() {
   if [ -f "$HYPOTHESES" ]; then
     hypotheses=$(cat "$HYPOTHESES" 2>/dev/null)
   fi
-  local prompt="You are the analyst for this Mac's watchdog. You have NO terminal and cannot run commands — analyse only. An incident just happened. Symptoms: $symptoms. Reflexes tried: ${REFLEX_LOG:-none}. Outcome: $outcome. State BEFORE the failure (observer, newest last): $events. Recent incident history (newest last): $history. Hypothesis table (id, occurrences, refutations, confidence, status, text): $hypotheses. Analyse: what most likely caused this (use the pre-failure events, not just the symptoms), is it a repeat of an earlier incident (say which one and how many times), and was an earlier hypothesis confirmed or refuted by this one (name its id)? Label your cause assessment HYPOTHESIS, PATTERN or ESTABLISHED. Answer the three questions: what broke, why does it keep happening, what should change so it does not happen again. Finish with two lines: first HYPOTHESIS: <short cause text> | CONFIDENCE: <level> | REFUTES: <id or none>, then ANSWER= followed by a short incident analysis (cause + confidence level + recurrence + recommendation). Keep it under 10 lines."
+  local prompt="You are the analyst for this Mac's watchdog. You have NO terminal and cannot run commands — analyse only. An incident just happened. Symptoms: $symptoms. Reflexes tried: ${REFLEX_LOG:-none}. Outcome: $outcome. State BEFORE the failure (observer, newest last): $events. Recent incident history (newest last): $history. Hypothesis table (id, occurrences, refutations, confidence, status, text): $hypotheses. Analyse: what most likely caused this (use the pre-failure events, not just the symptoms), is it a repeat of an earlier incident (say which one and how many times), and was an earlier hypothesis confirmed or refuted by this one (name its id)? Label your cause assessment with exactly one of these three words — HYPOTHESIS, PATTERN or ESTABLISHED — never a number or a percentage. Answer the three questions: what broke, why does it keep happening, what should change so it does not happen again. Finish with two lines: first HYPOTHESIS: <short cause text> | CONFIDENCE: <HYPOTHESIS or PATTERN or ESTABLISHED> | REFUTES: <id or none>, then ANSWER= followed by a short incident analysis (cause + confidence level + recurrence + recommendation). REFUTES names an id ONLY when the new evidence CONTRADICTS that hypothesis. If this incident CONFIRMS an earlier hypothesis (same cause again), write REFUTES: none. Keep it under 10 lines."
   echo "--- analyst ---" >> "$LOG"
   local out
   out=$(run_to "$MODEL_TIMEOUT" "$AGENT" ask "$prompt" 2>&1)
@@ -473,6 +487,7 @@ if [ "${1:-}" = "--test-analyst" ]; then
   REFLEX_LOG="dns-reset (test)"
   echo "TEST-ANALYST: invoking the analyst on prepared data (symptoms=$SYMPTOMS, outcome=${3:-FIXED-BY-REFLEX})" >> "$LOG"
   call_analyst "${3:-FIXED-BY-REFLEX}" "$SYMPTOMS"
+  python3 "$WATCHDOG_DIR/reasoning.py" 2>/dev/null
   echo "TEST-ANALYST: done. See incidents.log and hypotheses.tsv." >> "$LOG"
   exit 0
 fi

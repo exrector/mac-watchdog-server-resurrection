@@ -60,6 +60,7 @@ LOG="$WATCHDOG_DIR/watcher.log"
 INCIDENTS="$WATCHDOG_DIR/incidents.log"
 EVENTS="$WATCHDOG_DIR/events.log"
 TOOLS="$WATCHDOG_DIR/tools.tsv"
+ATTEMPTS="$WATCHDOG_DIR/tool-attempts.log"
 BLUEPRINT="$WATCHDOG_DIR/blueprint.md"
 AGENT="$WATCHDOG_DIR/recovery-agent"
 LOCK="$WATCHDOG_DIR/watcher.lock"
@@ -111,14 +112,82 @@ run_to() {
   return $rc
 }
 
-# Deterministic health verification. Prints one VERIFY line per item.
-# Sets BROKEN_ITEMS to an array of broken item names (empty when
-# healthy) and TS_STATUS to the raw Tailscale status line (for the
-# reflex to tell "stopped" from "logged out"). Returns 0 only if all
-# enabled checks are OK. A check is skipped when its config is empty:
-# Wi-Fi is skipped when WIFI_INTERFACE is empty (Ethernet-only Mac),
-# Tailscale is skipped when TAILSCALE_HOSTNAME is empty (no Tailscale).
-# A skipped check is not a failure.
+# Check ONE item by name. Prints one VERIFY line, returns 0 if OK,
+# 1 if BROKEN. A skipped check (Wi-Fi with no WIFI_INTERFACE, Tailscale
+# with no TAILSCALE_HOSTNAME) returns 0 — it is not a failure. Sets
+# TS_STATUS to the raw Tailscale status line (for the reflex to tell
+# "stopped" from "logged out"). Used both by verify_health (all items)
+# and by run_reflexes, which verifies each item IMMEDIATELY after its
+# reflex runs — so a tool is scored by the state of its own item right
+# after it acted, not by the global state after all reflexes. (Scoring
+# by the final global state misattributes success: if DNS and Tailscale
+# are both broken and DNS recovers after the Tailscale fix, the DNS tool
+# would wrongly get the credit.)
+verify_item() {
+  local item="$1" wifi ping dns route ts
+  case "$item" in
+    wifi)
+      if [ -z "${WIFI_INTERFACE:-}" ]; then
+        echo "VERIFY wifi SKIP (no WIFI_INTERFACE configured)" >> "$LOG"; return 0
+      fi
+      wifi=$(run_to 10 networksetup -getairportpower "$WIFI_INTERFACE" 2>&1)
+      if echo "$wifi" | grep -q "On"; then
+        echo "VERIFY wifi OK: $wifi" >> "$LOG"; return 0
+      else
+        echo "VERIFY wifi BROKEN: $wifi" >> "$LOG"; return 1
+      fi
+      ;;
+    ping)
+      ping=$(run_to 10 ping -c1 -q -W 2000 "$PING_TARGET" 2>&1)
+      if echo "$ping" | grep -q "1 packets received"; then
+        echo "VERIFY ping OK" >> "$LOG"; return 0
+      else
+        echo "VERIFY ping BROKEN: $ping" >> "$LOG"; return 1
+      fi
+      ;;
+    dns)
+      dns=$(run_to 15 dig +short "$DNS_TEST_HOST" 2>&1)
+      if echo "$dns" | grep -Eq "^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$"; then
+        echo "VERIFY dns OK: $dns" >> "$LOG"; return 0
+      else
+        echo "VERIFY dns BROKEN: $dns" >> "$LOG"; return 1
+      fi
+      ;;
+    route)
+      route=$(run_to 10 route -n get default 2>&1 | grep gateway)
+      if [ -n "${EXPECTED_GATEWAY:-}" ]; then
+        if echo "$route" | grep -q "$EXPECTED_GATEWAY"; then
+          echo "VERIFY route OK: $route" >> "$LOG"; return 0
+        else
+          echo "VERIFY route BROKEN: $route" >> "$LOG"; return 1
+        fi
+      else
+        if echo "$route" | grep -q "gateway:"; then
+          echo "VERIFY route OK: $route" >> "$LOG"; return 0
+        else
+          echo "VERIFY route BROKEN: $route" >> "$LOG"; return 1
+        fi
+      fi
+      ;;
+    tailscale)
+      if [ -z "${TAILSCALE_HOSTNAME:-}" ]; then
+        echo "VERIFY tailscale SKIP (no TAILSCALE_HOSTNAME configured)" >> "$LOG"; return 0
+      fi
+      ts=$(run_to 15 "$TAILSCALE_CLI" status 2>&1 | head -1)
+      TS_STATUS="$ts"
+      if echo "$ts" | grep -q "$TAILSCALE_HOSTNAME" && ! echo "$ts" | grep -Eqi "offline|stopped"; then
+        echo "VERIFY tailscale OK: $ts" >> "$LOG"; return 0
+      else
+        echo "VERIFY tailscale BROKEN: $ts" >> "$LOG"; return 1
+      fi
+      ;;
+  esac
+  return 0
+}
+
+# Deterministic health verification. Sets BROKEN_ITEMS to an array of
+# broken item names (empty when healthy). Returns 0 only if all enabled
+# checks are OK.
 # NOTE (critical): BROKEN_ITEMS is an ARRAY. In zsh, `for item in
 # $BROKEN` with BROKEN="dns tailscale" iterates ONCE with the whole
 # string — the reflexes would silently never fire. Always iterate
@@ -126,58 +195,15 @@ run_to() {
 BROKEN_ITEMS=()
 TS_STATUS=""
 verify_health() {
-  local ok=1
-  local wifi ping dns route ts
   BROKEN_ITEMS=()
   TS_STATUS=""
-  if [ -n "${WIFI_INTERFACE:-}" ]; then
-    wifi=$(run_to 10 networksetup -getairportpower "$WIFI_INTERFACE" 2>&1)
-    if echo "$wifi" | grep -q "On"; then
-      echo "VERIFY wifi OK: $wifi" >> "$LOG"
-    else
-      echo "VERIFY wifi BROKEN: $wifi" >> "$LOG"; ok=0; BROKEN_ITEMS+=(wifi)
+  local item
+  for item in wifi ping dns route tailscale; do
+    if ! verify_item "$item"; then
+      BROKEN_ITEMS+=("$item")
     fi
-  else
-    echo "VERIFY wifi SKIP (no WIFI_INTERFACE configured)" >> "$LOG"
-  fi
-  ping=$(run_to 10 ping -c1 -q -W 2000 "$PING_TARGET" 2>&1)
-  if echo "$ping" | grep -q "1 packets received"; then
-    echo "VERIFY ping OK" >> "$LOG"
-  else
-    echo "VERIFY ping BROKEN: $ping" >> "$LOG"; ok=0; BROKEN_ITEMS+=(ping)
-  fi
-  dns=$(run_to 15 dig +short "$DNS_TEST_HOST" 2>&1)
-  if echo "$dns" | grep -Eq "^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$"; then
-    echo "VERIFY dns OK: $dns" >> "$LOG"
-  else
-    echo "VERIFY dns BROKEN: $dns" >> "$LOG"; ok=0; BROKEN_ITEMS+=(dns)
-  fi
-  route=$(run_to 10 route -n get default 2>&1 | grep gateway)
-  if [ -n "${EXPECTED_GATEWAY:-}" ]; then
-    if echo "$route" | grep -q "$EXPECTED_GATEWAY"; then
-      echo "VERIFY route OK: $route" >> "$LOG"
-    else
-      echo "VERIFY route BROKEN: $route" >> "$LOG"; ok=0; BROKEN_ITEMS+=(route)
-    fi
-  else
-    if echo "$route" | grep -q "gateway:"; then
-      echo "VERIFY route OK: $route" >> "$LOG"
-    else
-      echo "VERIFY route BROKEN: $route" >> "$LOG"; ok=0; BROKEN_ITEMS+=(route)
-    fi
-  fi
-  if [ -n "${TAILSCALE_HOSTNAME:-}" ]; then
-    ts=$(run_to 15 "$TAILSCALE_CLI" status 2>&1 | head -1)
-    TS_STATUS="$ts"
-    if echo "$ts" | grep -q "$TAILSCALE_HOSTNAME" && ! echo "$ts" | grep -Eqi "offline|stopped"; then
-      echo "VERIFY tailscale OK: $ts" >> "$LOG"
-    else
-      echo "VERIFY tailscale BROKEN: $ts" >> "$LOG"; ok=0; BROKEN_ITEMS+=(tailscale)
-    fi
-  else
-    echo "VERIFY tailscale SKIP (no TAILSCALE_HOSTNAME configured)" >> "$LOG"
-  fi
-  return $((1 - ok))
+  done
+  [ "${#BROKEN_ITEMS[@]}" -eq 0 ]
 }
 
 # --- Reflexes: deterministic repair for KNOWN problems. ---
@@ -231,27 +257,44 @@ reflex_tailscale() {
     REFLEX_LOG="$REFLEX_LOG tailscale-up(rc=$?)"
   fi
 }
-# Run the reflex for every item in $BROKEN_ITEMS (array). Records each
-# reflex's duration in REFLEX_SECS and the items in REFLEXED_ITEMS, so
-# record_reflex_outcomes() can score them after the re-verify.
+# Run the reflex for every item in $BROKEN_ITEMS (array). After each
+# reflex, the item is verified IMMEDIATELY (verify_item) and the tool is
+# scored by that result — not by the global state after all reflexes.
+# That is the correct attribution: a tool gets credit only if its own
+# item recovered right after it acted. (A side effect — e.g. DNS
+# recovering because Tailscale came back — is not credited to the tool
+# that caused it; that is a known limitation, noted in the README.)
+# Each attempt is also appended to tool-attempts.log: one line per run
+# with its timestamp, tool, incident symptoms, duration and outcome.
+# The aggregate (tools.tsv) is for ranking; the per-attempt log is the
+# raw history the analyst and the reviewer use to judge a tool.
 run_reflexes() {
   REFLEX_LOG=""
-  REFLEXED_ITEMS=()
   REFLEX_TS_KIND=""
-  local start end
+  local start end secs item tool_id ok
   for item in "${BROKEN_ITEMS[@]}"; do
     case "$item" in
       wifi|dns|route|tailscale)
-        REFLEXED_ITEMS+=("$item")
         start=$(date +%s)
         case "$item" in
-          wifi) reflex_wifi ;;
-          dns) reflex_dns ;;
-          route) reflex_route ;;
-          tailscale) reflex_tailscale ;;
+          wifi) reflex_wifi; tool_id="wifi-on" ;;
+          dns) reflex_dns; tool_id="dns-reset" ;;
+          route) reflex_route; tool_id="route-add" ;;
+          tailscale)
+            reflex_tailscale
+            if [ "$REFLEX_TS_KIND" = "login" ]; then tool_id="tailscale-login"; else tool_id="tailscale-up"; fi
+            ;;
         esac
         end=$(date +%s)
-        REFLEX_SECS[$item]=$((end - start))
+        secs=$((end - start))
+        if verify_item "$item"; then
+          ok=1
+        else
+          ok=0
+        fi
+        record_tool_run "$tool_id" "$ok" "$secs" "$item"
+        echo "$(date '+%Y-%m-%d %H:%M:%S') $tool_id symptoms=$SYMPTOMS secs=$secs success=$ok" >> "$ATTEMPTS"
+        echo "TOOL $tool_id: success=$ok, ${secs}s" >> "$LOG"
         ;;
       ping) echo "REFLEX ping: no direct reflex (ping is a symptom, not a cause — the other reflexes address it)" >> "$LOG" ;;
     esac
@@ -286,36 +329,7 @@ record_tool_run() {
   fi
   awk -F'\t' -v id="$id" -v ok="$ok" -v secs="$secs" -v itype="$itype" 'BEGIN{OFS="\t"} $1==id{$4=$4+1; $5=$5+ok; $6=$6+secs; if(index($7, itype)==0){if($7!="")$7=$7","; $7=$7 itype} print; next} {print}' "$TOOLS" > "$TOOLS.tmp" 2>/dev/null && mv "$TOOLS.tmp" "$TOOLS"
 }
-# After the re-verify, record the outcome of every reflex that fired.
-# An item is a success if it is NO LONGER in BROKEN_ITEMS; it is a
-# failure if it is still broken. REFLEX_SECS holds each reflex's
-# duration (seconds), REFLEXED_ITEMS the items that got a reflex.
-# REFLEX_TS_KIND is "up" or "login" for the Tailscale reflex.
-typeset -A REFLEX_SECS
-REFLEXED_ITEMS=()
-REFLEX_TS_KIND=""
-record_reflex_outcomes() {
-  local item tool_id ok secs
-  for item in "${REFLEXED_ITEMS[@]}"; do
-    secs="${REFLEX_SECS[$item]:-0}"
-    case "$item" in
-      wifi) tool_id="wifi-on" ;;
-      dns) tool_id="dns-reset" ;;
-      route) tool_id="route-add" ;;
-      tailscale)
-        if [ "$REFLEX_TS_KIND" = "login" ]; then tool_id="tailscale-login"; else tool_id="tailscale-up"; fi
-        ;;
-      *) continue ;;
-    esac
-    ok=1
-    for b in "${BROKEN_ITEMS[@]}"; do
-      if [ "$b" = "$item" ]; then ok=0; break; fi
-    done
-    record_tool_run "$tool_id" "$ok" "$secs" "$item"
-    echo "TOOL $tool_id: runs updated (success=$ok, ${secs}s)" >> "$LOG"
-  done
-}
-# incidents.log is free text — it cannot reliably enforce the rule
+# --- Structured hypothesis memory (hypotheses.tsv). ---
 # "after three refutations, stop proposing a hypothesis". This table
 # does. Columns (tab-separated):
 #   id, first_seen, last_seen, occurrences, refutations, confidence,
@@ -456,11 +470,10 @@ echo "BROKEN items: $SYMPTOMS" >> "$LOG"
 # 2. Reflexes: deterministic repair for the known problems.
 run_reflexes
 
-# 3. Re-verify after the reflexes. Score the tools first (success =
-# item no longer broken), whatever the overall outcome is.
+# 3. Re-verify after the reflexes. (Each tool was already scored inline
+# in run_reflexes, by verifying its own item right after it acted.)
 verify_health
 _reflex_rc=$?
-record_reflex_outcomes
 if [ "$_reflex_rc" -eq 0 ]; then
   echo "VERIFIED HEALTHY after reflexes" >> "$LOG"
   call_analyst "FIXED-BY-REFLEX" "$SYMPTOMS"

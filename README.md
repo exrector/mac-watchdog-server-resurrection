@@ -192,8 +192,14 @@ deleted or modified — it is only demoted.
 **The library.** Each reflex is a tool with an id, a version, a
 checksum, a run history, and an effectiveness score (`tools.tsv`,
 maintained by `watcher.sh` after every reflex run: runs, successes,
-total time, incident types). The five built-in reflexes are the initial
-tools, all in state `preferred`.
+total time, incident types). The raw history of individual attempts —
+timestamp, tool, incident symptoms, duration, outcome — is in
+`tool-attempts.log`. **Attribution is per-item:** after each reflex,
+the Watcher re-checks that tool's own item immediately and scores the
+tool by that result, not by the global state after all reflexes. (A
+side effect — e.g. DNS recovering because Tailscale came back — is not
+credited to the tool that caused it; that is a known limitation.) The
+five built-in reflexes are the initial tools, all in state `preferred`.
 
 **Lifecycle (four states).** A tool moves through:
 - `candidate` — the model created it as a separate script. Not yet
@@ -394,6 +400,39 @@ Be honest about what this cannot do:
 
 ## Testing it
 
+**First time on a machine that already runs a watchdog: install to a
+separate directory and do NOT activate the agents.** The installer
+defaults to `~/watchdog`; if a live watchdog already lives there,
+installing over it would replace the working system with an untested
+one. Use `--dir` for a test directory and `--no-agents` to skip the
+LaunchAgents, then run the pieces by hand. Three stages:
+
+**Stage 1 — install without activation.** Check the build or the
+prebuilt binary, the config, the Keychain, and the Foundation Models
+selftest. No agents, no network changes.
+
+```sh
+./install.sh --dir ~/watchdog-test --no-agents --no-secrets
+/bin/zsh ~/watchdog-test/watcher.sh --dry-run
+~/watchdog-test/recovery-agent selftest
+```
+
+**Stage 2 — safe diagnostics.** Check `observer.sh`,
+`watcher.sh --dry-run`, log creation, and a normal analyst run on
+prepared data. No intentional network disconnection.
+
+```sh
+/bin/zsh ~/watchdog-test/observer.sh; tail ~/watchdog-test/events.log
+/bin/zsh ~/watchdog-test/watcher.sh --dry-run
+tail ~/watchdog-test/watcher.log
+```
+
+**Stage 3 — controlled failures.** Only with independent access to the
+machine (so you can recover it if the watchdog fails). Check DNS,
+Tailscale, and combined-failure recovery. Separately verify that tool
+success, duration, and repeat incidents are recorded correctly
+(`tools.tsv`, `tool-attempts.log`, `incidents.log`).
+
 Break something on purpose and watch it heal. The Watcher runs every
 `CHECK_INTERVAL`; give it one tick plus up to a minute for the model.
 
@@ -421,6 +460,10 @@ Dry run (check only, change nothing):
 ```sh
 /bin/zsh ~/watchdog/watcher.sh --dry-run
 ```
+
+**Readiness criterion for a release:** a successful full cycle on a
+real Mac — from failure detection to recovery and the analyst's recorded
+conclusion. Until such a test exists, new architectural features wait.
 
 ## Uninstall
 

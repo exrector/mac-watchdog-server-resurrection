@@ -269,11 +269,11 @@ if [ "$DO_AGENTS" -eq 1 ]; then
   _ci="${CHECK_INTERVAL:-300}"
   _wd_esc=$(sed_escape "$WATCHDOG_DIR")
   _sup_esc=$(sed_escape "$SUPPORT_DIR")
-  _agents="watcher bootstrap observer review"
+  _agents=(watcher bootstrap observer review)
   if [ "$DO_CALL_HOME" -eq 1 ]; then
-    _agents="$_agents call-home"
+    _agents+=(call-home)
   fi
-  for p in $_agents; do
+  for p in "${_agents[@]}"; do
     _tmpl="$SRC_DIR/com.macwatchdog.$p.plist"
     _dst="$HOME/Library/LaunchAgents/com.macwatchdog.$p.plist"
     sed -e "s|__WATCHDOG_DIR__|$_wd_esc|g" \

@@ -25,11 +25,53 @@ jobs:
         run: |
           sudo apt-get install -y zsh
           for f in install.sh uninstall.sh watcher.sh watchdog-bootstrap.sh \
-                   lib/get-secret.sh scripts/setup-secrets.sh \
-                   call-home.sh call-home-loop.sh click-allow.sh; do
+                   observer.sh review.sh lib/get-secret.sh \
+                   scripts/setup-secrets.sh call-home.sh call-home-loop.sh \
+                   click-allow.sh; do
             zsh -n "$f" || { echo "SYNTAX FAIL: $f"; exit 1; }
           done
           echo "All zsh scripts parse."
+
+      - name: plist templates are well-formed XML
+        run: |
+          # Well-formed XML only — NOT plist validation: the templates
+          # contain placeholders like __CHECK_INTERVAL__ inside an
+          # <integer> element, which plistlib rejects (it must be a
+          # number). The installer substitutes the real values. So we
+          # check XML syntax with ElementTree, not plist types.
+          python3 -c "
+          import xml.etree.ElementTree as ET, glob
+          for p in glob.glob('com.macwatchdog.*.plist'):
+              ET.parse(p)
+              print('OK', p)
+          "
+
+      - name: every agent the installer registers has a plist template
+        run: |
+          # Extract the agent names from install.sh's _agents array and
+          # verify each has a com.macwatchdog.<name>.plist template.
+          # This catches the class of bug where the agent list and the
+          # plist files drift apart (or the list is a string, not an array).
+          _agents=$(grep -oP '_agents=\(\K[^)]*' install.sh | tr ' ' '\n')
+          if grep -q '_agents+=(call-home)' install.sh; then
+            _agents="$_agents
+          call-home"
+          fi
+          for p in $_agents; do
+            if [ ! -f "com.macwatchdog.$p.plist" ]; then
+              echo "MISSING PLIST for agent: $p"
+              exit 1
+            fi
+            echo "OK agent $p -> com.macwatchdog.$p.plist"
+          done
+          # And the reverse: no orphan plist without an agent.
+          for f in com.macwatchdog.*.plist; do
+            _name=$(echo "$f" | sed 's/com.macwatchdog.//; s/.plist//')
+            if ! echo "$_agents" | grep -qx "$_name"; then
+              echo "ORPHAN PLIST (no agent in install.sh): $f"
+              exit 1
+            fi
+          done
 
       - name: python syntax check
         run: python3 -m py_compile reasoning.py

@@ -333,21 +333,33 @@ record_tool_run() {
 # "after three refutations, stop proposing a hypothesis". This table
 # does. Columns (tab-separated):
 #   id, first_seen, last_seen, occurrences, refutations, confidence,
-#   status (active|refuted|established), text
+#   status (active|refuted|established), text, evidence
+# The evidence column ties each hypothesis to the specific incidents
+# that support it: a comma-separated list of "timestamp:symptoms".
+# A hypothesis is never a fact on its own — it is an interpretation,
+# and the evidence column shows exactly which incidents it rests on.
 # The analyst's ANSWER must contain a line:
 #   HYPOTHESIS: <short text> | CONFIDENCE: <HYPOTHESIS|PATTERN|ESTABLISHED> | REFUTES: <id|none>
 # record_hypothesis() parses that line and updates the table. The next
 # analyst call receives the table, so it can reference hypothesis IDs
 # and see refutation counts instead of guessing from prose.
+# Arguments: $1 = the analyst's answer, $2 = the current symptoms
+# (for the evidence column).
 HYPOTHESES="$WATCHDOG_DIR/hypotheses.tsv"
 record_hypothesis() {
-  local answer="$1" line text conf refutes now
+  local answer="$1" symptoms="$2" line text conf refutes now
   line=$(echo "$answer" | grep "^HYPOTHESIS:" | head -1)
   [ -z "$line" ] && return 0
   text=$(echo "$line" | sed 's/^HYPOTHESIS: *//; s/ *| CONFIDENCE:.*//' | tr -d '\t' | sed 's/^ *//; s/ *$//')
   conf=$(echo "$line" | sed 's/.*| CONFIDENCE: *//; s/ *| REFUTES:.*//' | tr -d ' \t')
   refutes=$(echo "$line" | sed 's/.*| REFUTES: *//' | tr -d ' \t')
   [ -z "$text" ] && return 0
+  # UNKNOWN is not a hypothesis — it means the evidence did not support
+  # a cause. Do not record it as a supported hypothesis.
+  if [ "$text" = "UNKNOWN" ]; then
+    echo "HYPOTHESIS UNKNOWN: no supported cause recorded" >> "$LOG"
+    return 0
+  fi
   [ -z "$conf" ] && conf="HYPOTHESIS"
   # Normalise the confidence level: it must be one of the three words.
   # The model sometimes answers with a number ("95") — a percentage is
@@ -358,7 +370,7 @@ record_hypothesis() {
   esac
   now=$(date '+%Y-%m-%d %H:%M:%S')
   if [ ! -f "$HYPOTHESES" ]; then
-    printf 'id\tfirst_seen\tlast_seen\toccurrences\trefutations\tconfidence\tstatus\ttext\n' > "$HYPOTHESES"
+    printf 'id\tfirst_seen\tlast_seen\toccurrences\trefutations\tconfidence\tstatus\ttext\tevidence\n' > "$HYPOTHESES"
   fi
   # 1. A refutation: the new incident disproves an earlier hypothesis.
   # Guard: if the refuted id's text MATCHES the new hypothesis text, the
@@ -372,17 +384,50 @@ record_hypothesis() {
       echo "HYPOTHESIS $refutes refuted (refutations now $(awk -F'\t' -v id="$refutes" '$1==id{print $5}' "$HYPOTHESES"))" >> "$LOG"
     fi
   fi
-  # 2. Same hypothesis as an existing active one: count the occurrence.
+  # 2. Same hypothesis as an existing active one: count the occurrence
+  # and append this incident to the evidence column.
   if awk -F'\t' -v txt="$text" 'NR>1 && index(tolower($8), tolower(txt))>0{found=1} END{exit !found}' "$HYPOTHESES" 2>/dev/null; then
-    awk -F'\t' -v txt="$text" -v now="$now" -v conf="$conf" 'BEGIN{OFS="\t"} NR>1 && index(tolower($8), tolower(txt))>0{$4=$4+1; $3=now; $6=conf; print; next} {print}' "$HYPOTHESES" > "$HYPOTHESES.tmp" 2>/dev/null && mv "$HYPOTHESES.tmp" "$HYPOTHESES"
+    awk -F'\t' -v txt="$text" -v now="$now" -v conf="$conf" -v ev="$now:$symptoms" 'BEGIN{OFS="\t"} NR>1 && index(tolower($8), tolower(txt))>0{$4=$4+1; $3=now; $6=conf; if($9!="")$9=$9","; $9=$9 ev; print; next} {print}' "$HYPOTHESES" > "$HYPOTHESES.tmp" 2>/dev/null && mv "$HYPOTHESES.tmp" "$HYPOTHESES"
     echo "HYPOTHESIS occurrence counted for: $text" >> "$LOG"
   else
-    # 3. New hypothesis: next id.
+    # 3. New hypothesis: next id, with this incident as its first evidence.
     local next_id
     next_id=$(awk -F'\t' 'NR>1 && $1 ~ /^H[0-9]+$/{n=substr($1,2)+0; if(n>m)m=n} END{print "H" (m+1)}' "$HYPOTHESES" 2>/dev/null)
-    printf '%s\t%s\t%s\t1\t0\t%s\tactive\t%s\n' "$next_id" "$now" "$now" "$conf" "$text" >> "$HYPOTHESES"
+    printf '%s\t%s\t%s\t1\t0\t%s\tactive\t%s\t%s:%s\n' "$next_id" "$now" "$now" "$conf" "$text" "$now" "$symptoms" >> "$HYPOTHESES"
     echo "HYPOTHESIS $next_id recorded: $text" >> "$LOG"
   fi
+}
+
+# Deterministic verification of the analyst's hypothesis (Proposal 3).
+# The model's conclusion must be about something that was actually
+# broken in this incident. Extract the symptom keywords from the
+# HYPOTHESIS text (dns, tailscale, wifi, route, ping). If the text
+# mentions symptoms but NONE of them were broken in this incident, the
+# hypothesis is unsupported: the model attributed the incident to
+# something that was not broken. The answer is rewritten with
+# HYPOTHESIS: UNKNOWN, so the unsupported claim never inflates a
+# hypothesis in the memory. If the text mentions no symptom keyword at
+# all, it cannot be verified this way and passes through.
+verify_hypothesis() {
+  local answer="$1" symptoms="$2"
+  local line text low sym mentioned supported
+  line=$(echo "$answer" | grep "^HYPOTHESIS:" | head -1)
+  if [ -z "$line" ]; then echo "$answer"; return 0; fi
+  text=$(echo "$line" | sed 's/^HYPOTHESIS: *//; s/ *| CONFIDENCE:.*//')
+  low=$(echo "$text" | tr 'A-Z' 'a-z')
+  mentioned=0; supported=0
+  for sym in dns tailscale wifi route ping; do
+    if echo "$low" | grep -q "$sym"; then
+      mentioned=1
+      if echo "$symptoms" | grep -qw "$sym"; then supported=1; fi
+    fi
+  done
+  if [ "$mentioned" -eq 1 ] && [ "$supported" -eq 0 ]; then
+    echo "HYPOTHESIS UNSUPPORTED: '$text' is about symptoms not broken in this incident ($symptoms) — recording UNKNOWN" >> "$LOG"
+    echo "$answer" | sed 's/^HYPOTHESIS:.*/HYPOTHESIS: UNKNOWN | CONFIDENCE: HYPOTHESIS | REFUTES: none/'
+    return 0
+  fi
+  echo "$answer"
 }
 # --- Analyst: the model as investigator, not repairman. ---
 # After an incident (fixed by reflexes, fixed by the model, or gave up),
@@ -464,36 +509,64 @@ filter_hypotheses_by_symptoms() {
 }
 call_analyst() {
   local outcome="$1" symptoms="$2"
-  local history="" events="" hypotheses=""
-  if [ -f "$INCIDENTS" ]; then
-    history=$(filter_history_by_symptoms "$INCIDENTS" "$symptoms" "$INCIDENT_HISTORY_LINES" 2>/dev/null)
-  fi
+  local events="" history="" hypotheses=""
   if [ -f "$EVENTS" ]; then
     events=$(tail -n 30 "$EVENTS" 2>/dev/null)
+  fi
+  # Phase 1: analyse ONLY the current incident. No history, no
+  # hypotheses — the model forms a preliminary conclusion from the
+  # current facts alone, so a dominant old pattern cannot anchor it.
+  # The diagnostic experiment showed the model misattributes even with
+  # a clean context, so Phase 1 alone is not trusted either — Phase 2
+  # and the deterministic verification below are the safety net.
+  echo "--- analyst phase 1 (current incident only) ---" >> "$LOG"
+  local prompt1="You are the analyst for this Mac's watchdog. You have NO terminal and cannot run commands — analyse only. An incident just happened. SYMPTOMS (what was broken): $symptoms. Reflexes tried: ${REFLEX_LOG:-none}. Outcome: $outcome. State BEFORE the failure (observer, newest last): $events. Analyse ONLY this incident: what broke, and what most likely caused it. Use the symptoms and the pre-failure events. Do NOT invent history — there is none in this prompt. Label your cause assessment with exactly one of these three words — HYPOTHESIS, PATTERN or ESTABLISHED — never a number or a percentage. Finish with one line: HYPOTHESIS: <short cause text> | CONFIDENCE: <HYPOTHESIS or PATTERN or ESTABLISHED> | REFUTES: none. Keep it under 5 lines."
+  local out1
+  out1=$(run_to "$MODEL_TIMEOUT" "$AGENT" ask "$prompt1" 2>&1)
+  local rc1=$?
+  if [ "$rc1" -eq 124 ]; then
+    pkill -9 -f "recovery-agent ask" 2>/dev/null
+    echo "ANALYST PHASE 1 TIMEOUT" >> "$LOG"
+  fi
+  echo "$out1" >> "$LOG"
+  local prelim
+  prelim=$(echo "$out1" | grep "^HYPOTHESIS:" | head -1)
+  # Phase 2: compare the preliminary conclusion against the history.
+  # Only now does the model see past incidents and hypotheses — and
+  # only those with the SAME symptoms, so a frequent pattern for a
+  # different symptom cannot hijack this incident.
+  if [ -f "$INCIDENTS" ]; then
+    history=$(filter_history_by_symptoms "$INCIDENTS" "$symptoms" "$INCIDENT_HISTORY_LINES" 2>/dev/null)
   fi
   if [ -f "$HYPOTHESES" ]; then
     hypotheses=$(filter_hypotheses_by_symptoms "$HYPOTHESES" "$symptoms" 2>/dev/null)
   fi
-  local prompt="You are the analyst for this Mac's watchdog. You have NO terminal and cannot run commands — analyse only. An incident just happened. THE CURRENT INCIDENT'S SYMPTOMS ARE: $symptoms. Analyse THIS incident first — what broke here, and why. The incident history below is ONLY to check whether THESE SAME symptoms happened before; do NOT attribute this incident to a different symptom's pattern just because that pattern is frequent in the history. Reflexes tried: ${REFLEX_LOG:-none}. Outcome: $outcome. State BEFORE the failure (observer, newest last): $events. Recent incident history (newest last): $history. Hypothesis table (id, occurrences, refutations, confidence, status, text): $hypotheses. Analyse: what most likely caused this (use the pre-failure events, not just the symptoms), is it a repeat of an earlier incident WITH THE SAME SYMPTOMS (say which one and how many times), and was an earlier hypothesis confirmed or refuted by this one (name its id)? Label your cause assessment with exactly one of these three words — HYPOTHESIS, PATTERN or ESTABLISHED — never a number or a percentage. Answer the three questions: what broke, why does it keep happening, what should change so it does not happen again. Finish with two lines: first HYPOTHESIS: <short cause text> | CONFIDENCE: <HYPOTHESIS or PATTERN or ESTABLISHED> | REFUTES: <id or none>, then ANSWER= followed by a short incident analysis (cause + confidence level + recurrence + recommendation). REFUTES names an id ONLY when the new evidence CONTRADICTS that hypothesis. If this incident CONFIRMS an earlier hypothesis (same cause again), write REFUTES: none. Keep it under 10 lines."
-  echo "--- analyst ---" >> "$LOG"
+  echo "--- analyst phase 2 (compare with history) ---" >> "$LOG"
+  local prompt2="You are the analyst for this Mac's watchdog. You have NO terminal and cannot run commands — analyse only. Preliminary conclusion for the CURRENT incident (symptoms: $symptoms, outcome: $outcome): $prelim. Now compare it with the history. Recent incident history with THE SAME SYMPTOMS (newest last): $history. Hypothesis table for THESE symptoms (id, occurrences, refutations, confidence, status, text, evidence): $hypotheses. Is the preliminary conclusion a repeat of an earlier incident WITH THE SAME SYMPTOMS? If yes, say which one and how many times, and confirm or upgrade the confidence (HYPOTHESIS -> PATTERN after 2+ same-symptom occurrences). If the preliminary conclusion does NOT match the history, say so — do not force it onto an old pattern. Was an earlier hypothesis confirmed or refuted by this incident (name its id)? REFUTES names an id ONLY when the new evidence CONTRADICTS that hypothesis. If this incident CONFIRMS an earlier hypothesis (same cause again), write REFUTES: none. Answer the three questions: what broke, why does it keep happening, what should change so it does not happen again. Finish with two lines: first HYPOTHESIS: <short cause text> | CONFIDENCE: <HYPOTHESIS or PATTERN or ESTABLISHED> | REFUTES: <id or none>, then ANSWER= followed by a short incident analysis (cause + confidence level + recurrence + recommendation). Keep it under 10 lines."
   local out
-  out=$(run_to "$MODEL_TIMEOUT" "$AGENT" ask "$prompt" 2>&1)
+  out=$(run_to "$MODEL_TIMEOUT" "$AGENT" ask "$prompt2" 2>&1)
   local rc=$?
   if [ "$rc" -eq 124 ]; then
     pkill -9 -f "recovery-agent ask" 2>/dev/null
     echo "ANALYST TIMEOUT" >> "$LOG"
   fi
   echo "$out" >> "$LOG"
-  # Update the structured hypothesis memory from the analyst's answer.
-  record_hypothesis "$out"
+  # Deterministic verification: the model's hypothesis must be about
+  # something that was actually broken in this incident. If it is not,
+  # the answer is rewritten with HYPOTHESIS: UNKNOWN, so the
+  # unsupported claim never inflates a hypothesis in the memory.
+  local verified_out
+  verified_out=$(verify_hypothesis "$out" "$symptoms")
+  # Update the structured hypothesis memory from the verified answer.
+  record_hypothesis "$verified_out" "$symptoms"
   # Record the incident: facts from the script + the model's analysis.
   {
     echo "=== $(date '+%Y-%m-%d %H:%M:%S') INCIDENT ==="
     echo "SYMPTOMS: $symptoms"
     echo "REFLEXES: ${REFLEX_LOG:-none}"
     echo "OUTCOME: $outcome"
-    echo "$out" | grep -A 20 "^ANSWER=" | sed 's/^/ANALYSIS: /'
-    echo "$out" | grep "^HYPOTHESIS:" | sed 's/^/CAUSE: /'
+    echo "$verified_out" | grep -A 20 "^ANSWER=" | sed 's/^/ANALYSIS: /'
+    echo "$verified_out" | grep "^HYPOTHESIS:" | sed 's/^/CAUSE: /'
   } >> "$INCIDENTS"
   echo "INCIDENT recorded in $INCIDENTS" >> "$LOG"
 }
@@ -526,7 +599,13 @@ fi
 # conclusion in incidents.log and hypotheses.tsv.
 if [ "${1:-}" = "--test-analyst" ]; then
   SYMPTOMS="${2:-dns}"
-  REFLEX_LOG="dns-reset (test)"
+  case "$SYMPTOMS" in
+    *tailscale*) REFLEX_LOG="tailscale-up (test)" ;;
+    *dns*) REFLEX_LOG="dns-reset (test)" ;;
+    *wifi*) REFLEX_LOG="wifi-on (test)" ;;
+    *route*) REFLEX_LOG="route-add (test)" ;;
+    *) REFLEX_LOG="none (test)" ;;
+  esac
   echo "TEST-ANALYST: invoking the analyst on prepared data (symptoms=$SYMPTOMS, outcome=${3:-FIXED-BY-REFLEX})" >> "$LOG"
   call_analyst "${3:-FIXED-BY-REFLEX}" "$SYMPTOMS"
   python3 "$WATCHDOG_DIR/reasoning.py" 2>/dev/null

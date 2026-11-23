@@ -277,6 +277,21 @@ the earlier Evolution Engine sketch (research → proposal → experiment
 → apply → observe → decide) still applies; Adaptive Tool Evolution is
 the safer shape of it: evolve the library, not the system.
 
+**Audit fixes (v1.2.0, ChatGPT review of 62362e5).** An independent
+audit found eight issues; all were verified against the code and fixed:
+the Swift `ANSWER=` marker is now on its own line so a model answer
+starting with TOOL-EVAL: or HYPOTHESIS: is not lost; the selector
+excludes candidate tools and only returns implemented ones, falling
+back to the next ranked tool; `--test-analyst` runs in a temp dir with
+copies so synthetic tests never pollute real memory; the watcher lock
+is validated by PID and age so a crash cannot block the watcher
+forever; the bootstrap backs up and restores the memory files
+(incidents.log, hypotheses.tsv, tools.tsv, tool-attempts.log);
+verify_hypothesis checks the first-mentioned symptom (the claimed
+cause), not just any keyword; review.sh receives the tool registry and
+attempt log and the blueprint section embedded in the prompt; and
+install.sh patches the bootstrap's default dir for `--dir` installs.
+
 ## What the reflexes repair
 
 The five known problems, fixed deterministically by the script (no

@@ -74,12 +74,32 @@ if [ "$LOG_MAX_LINES" -gt 0 ] && [ -f "$LOG" ]; then
   fi
 fi
 
-# Prevent overlapping runs.
+# Prevent overlapping runs. The lock file holds the PID of the running
+# watcher. A bare existence check is not enough: if the process dies
+# via SIGKILL or crashes, the EXIT trap never runs and the lock stays,
+# blocking every future run forever. So the lock is validated, not
+# just checked: it is stale if its PID is gone, if the PID was reused
+# by a different process, or if it is older than 15 minutes (a single
+# watcher run finishes in minutes). A stale lock is removed and the
+# run proceeds; a live lock still skips the run.
 if [ -e "$LOCK" ]; then
-  echo "$(date '+%Y-%m-%d %H:%M:%S') SKIP overlap, lock exists" >> "$LOG"
-  exit 0
+  _lock_pid=$(cat "$LOCK" 2>/dev/null | tr -d ' \t\n')
+  _lock_mtime=$(stat -f %m "$LOCK" 2>/dev/null || echo 0)
+  _lock_age=$(( $(date +%s) - _lock_mtime ))
+  _stale=0
+  if [ -z "$_lock_pid" ]; then _stale=1; fi
+  if [ "$_stale" -eq 0 ] && ! kill -0 "$_lock_pid" 2>/dev/null; then _stale=1; fi
+  if [ "$_stale" -eq 0 ] && ! ps -p "$_lock_pid" -o args= 2>/dev/null | grep -q "watcher"; then _stale=1; fi
+  if [ "$_lock_age" -gt 900 ]; then _stale=1; fi
+  if [ "$_stale" -eq 1 ]; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') STALE lock (pid=${_lock_pid:-none}, age=${_lock_age}s), removing" >> "$LOG"
+    rm -f "$LOCK"
+  else
+    echo "$(date '+%Y-%m-%d %H:%M:%S') SKIP overlap, lock held by pid $_lock_pid" >> "$LOG"
+    exit 0
+  fi
 fi
-touch "$LOCK"
+echo $$ > "$LOCK"
 trap 'rm -f "$LOCK"' EXIT
 
 echo "=== $(date '+%Y-%m-%d %H:%M:%S') WAKE ===" >> "$LOG"
@@ -292,10 +312,19 @@ run_reflexes() {
     case "$item" in
       wifi|dns|route|tailscale)
         # Select the tool by its registry score: the highest-scored
-        # tool for this symptom is the one applied. If the registry
-        # has no tool for this symptom yet, fall back to the built-in
-        # default for it.
-        tool_id=$(select_tool_for_symptom "$item")
+        # IMPLEMENTED tool for this symptom is the one applied. The
+        # registry lists tools best-first (candidates excluded); the
+        # first one that is actually runnable wins. If a high-scored
+        # tool has no implementation, it is skipped and the next one
+        # is tried — a registered-but-unimplemented tool must never
+        # block the repair of its symptom. If the registry has no
+        # implemented tool for this symptom yet, fall back to the
+        # built-in default for it.
+        tool_id=""
+        for _cand in $(select_tool_for_symptom "$item" 2>/dev/null); do
+          if tool_is_implemented "$_cand"; then tool_id="$_cand"; break; fi
+          echo "TOOL-SELECT $item: $_cand has no implementation, trying next" >> "$LOG"
+        done
         if [ -z "$tool_id" ]; then
           case "$item" in
             wifi) tool_id="wifi-on" ;;
@@ -311,7 +340,11 @@ run_reflexes() {
           dns-reset) reflex_dns ;;
           route-add) reflex_route ;;
           tailscale-up|tailscale-login) reflex_tailscale ;;
-          *) echo "TOOL $tool_id: no implementation, skipping" >> "$LOG"; continue ;;
+          *) if [ -x "$WATCHDOG_DIR/tools/$tool_id.sh" ]; then
+               "$WATCHDOG_DIR/tools/$tool_id.sh" >> "$LOG" 2>&1
+             else
+               echo "TOOL $tool_id: no implementation, skipping" >> "$LOG"; continue
+             fi ;;
         esac
         # For tailscale, the reflex may have done a login instead of a
         # plain up (state decides: logged out needs a login). Record
@@ -339,39 +372,57 @@ run_reflexes() {
 }
 
 # --- Tool selection by score (Adaptive Tool Evolution, the ranking). ---
-# Given a symptom, pick the tool with the highest score from the
-# registry (tools.tsv). The score is the smoothed success rate
-# (successes+1)/(runs+2) — Laplace smoothing, so a new tool starts at
-# a neutral 0.5 and a tool with more evidence wins over one with a
+# Given a symptom, list the tools for it from the registry (tools.tsv),
+# best score first, one id per line. The score is the smoothed success
+# rate (successes+1)/(runs+2) — Laplace smoothing, so a new tool starts
+# at a neutral 0.5 and a tool with more evidence wins over one with a
 # single lucky run — plus a small state weight (preferred 3, verified
-# 2, candidate 1), with faster average time breaking ties. Every tool
-# in the registry stays eligible — a tool is never deleted or crossed
-# out, it simply is not chosen while its score is lower, and it can win
-# again later if its record improves. The tool with the highest score
-# is the one applied at the next failure for that symptom. A new tool
-# is NEVER a modification of an existing one: it is added alongside,
-# and the statistics decide which one is preferred. Returns the tool
-# id, or nothing if no tool in the registry handles this symptom.
+# 2), with faster average time breaking ties. Every tool in the
+# registry stays eligible — a tool is never deleted or crossed out, it
+# simply is not chosen while its score is lower, and it can win again
+# later if its record improves. A new tool is NEVER a modification of
+# an existing one: it is added alongside, and the statistics decide
+# which one is preferred.
+# Two safety gates (audit fixes):
+#   - candidate tools are NOT listed: a candidate is created, not yet
+#     admitted. It must pass independent admission checks before it
+#     runs on a live failure — an untested tool must never beat a
+#     proven one in real repair.
+#   - the caller must check that a listed tool is actually implemented
+#     (tool_is_implemented) and fall back to the next one if it is not.
+#     A high-scored tool with no implementation must not block the
+#     repair of its symptom.
 select_tool_for_symptom() {
   local sym="$1"
   [ -f "$TOOLS" ] || return 1
   awk -F'\t' -v sym="$sym" '
     NR==1 { next }
+    $3 == "candidate" { next }
     {
       n = split($7, types, ",")
       found = 0
       for (i = 1; i <= n; i++) if (types[i] == sym) found = 1
       if (!found) next
       rate = ($5 + 1) / ($4 + 2)
-      w = ($3 == "preferred") ? 3 : ($3 == "verified") ? 2 : 1
+      w = ($3 == "preferred") ? 3 : 2
       avg = ($4 > 0) ? $6 / $4 : 0
       score = rate * 100 + w
-      if (score > best_score || (score == best_score && avg < best_avg)) {
-        best_score = score; best_avg = avg; best_id = $1
-      }
+      printf "%.4f\t%.4f\t%s\n", score, avg, $1
     }
-    END { if (best_id != "") print best_id }
-  ' "$TOOLS" 2>/dev/null
+  ' "$TOOLS" 2>/dev/null | sort -t "$(printf '\t')" -k1,1nr -k2,2n | cut -f3
+}
+
+# Is this tool actually runnable? A built-in reflex (the case branches
+# in run_reflexes) or an executable script in $WATCHDOG_DIR/tools/.
+# A tool that is registered but not implemented must never be selected
+# for a live repair — the caller falls back to the next ranked tool.
+tool_is_implemented() {
+  local id="$1"
+  case "$id" in
+    wifi-on|dns-reset|route-add|tailscale-up|tailscale-login) return 0 ;;
+  esac
+  [ -x "$WATCHDOG_DIR/tools/$id.sh" ] && return 0
+  return 1
 }
 
 # --- Tool registry (tools.tsv) — the foundation of Adaptive Tool Evolution. ---
@@ -496,20 +547,35 @@ record_hypothesis() {
 # all, it cannot be verified this way and passes through.
 verify_hypothesis() {
   local answer="$1" symptoms="$2"
-  local line text low sym mentioned supported
+  local line text low sym mentioned supported first first_sym
   line=$(echo "$answer" | grep "^HYPOTHESIS:" | head -1)
   if [ -z "$line" ]; then echo "$answer"; return 0; fi
   text=$(echo "$line" | sed 's/^HYPOTHESIS: *//; s/ *| CONFIDENCE:.*//')
   low=$(echo "$text" | tr 'A-Z' 'a-z')
-  mentioned=0; supported=0
+  # A hypothesis is only supported if it is ABOUT a symptom that was
+  # actually broken. Mentioning a broken symptom is not enough: the
+  # claim "DNS failure caused the Tailscale shutdown" mentions
+  # tailscale (as the effect) but its cause is DNS, which was not
+  # broken — keyword presence does not confirm causation. So the check
+  # is on the FIRST symptom the text mentions, read left to right: the
+  # first-named symptom is the claimed cause. If it was not broken,
+  # the hypothesis is unsupported, even if a broken symptom also
+  # appears later in the sentence.
+  first=""
   for sym in dns tailscale wifi route ping; do
-    if echo "$low" | grep -q "$sym"; then
-      mentioned=1
-      if echo "$symptoms" | grep -qw "$sym"; then supported=1; fi
+    _pos=$(echo "$low" | awk -v s="$sym" '{print index($0, s)}')
+    if [ "$_pos" -gt 0 ] && { [ -z "$first" ] || [ "$_pos" -lt "${first%%:*}" ]; }; then
+      first="$_pos:$sym"
     fi
   done
+  first_sym="${first#*:}"
+  mentioned=0; supported=0
+  if [ -n "$first_sym" ]; then
+    mentioned=1
+    if echo "$symptoms" | grep -qw "$first_sym"; then supported=1; fi
+  fi
   if [ "$mentioned" -eq 1 ] && [ "$supported" -eq 0 ]; then
-    echo "HYPOTHESIS UNSUPPORTED: '$text' is about symptoms not broken in this incident ($symptoms) — recording UNKNOWN" >> "$LOG"
+    echo "HYPOTHESIS UNSUPPORTED: '$text' claims '$first_sym' as the cause, but it was not broken in this incident ($symptoms) — recording UNKNOWN" >> "$LOG"
     echo "$answer" | sed 's/^HYPOTHESIS:.*/HYPOTHESIS: UNKNOWN | CONFIDENCE: HYPOTHESIS | REFUTES: none/'
     return 0
   fi
@@ -718,7 +784,7 @@ call_analyst() {
     echo "SYMPTOMS: $symptoms"
     echo "REFLEXES: ${REFLEX_LOG:-none}"
     echo "OUTCOME: $outcome"
-    echo "$verified_out" | grep -A 20 "^ANSWER=" | sed 's/^/ANALYSIS: /'
+    echo "$verified_out" | grep -A 20 "^ANSWER=" | tail -n +2 | sed 's/^/ANALYSIS: /'
     echo "$verified_out" | grep "^HYPOTHESIS:" | head -1 | sed -E 's/(REFUTES: (none|H[0-9]+)).*/\1/' | sed 's/^/CAUSE: /'
   } >> "$INCIDENTS"
   echo "INCIDENT recorded in $INCIDENTS" >> "$LOG"
@@ -750,7 +816,29 @@ fi
 # events.log, and a hypothesis to hypotheses.tsv — then the analyst
 # should spot the pattern (or refute the hypothesis) and record its
 # conclusion in incidents.log and hypotheses.tsv.
+# ISOLATION (audit fix): the test runs in a TEMP dir with COPIES of the
+# data files. A synthetic test must never write to the real
+# incidents.log, hypotheses.tsv or tools.tsv — otherwise it pollutes
+# the statistics that future real decisions rely on. The real files
+# are untouched; the test's writes land in the temp dir, whose path is
+# printed at the end for inspection.
 if [ "${1:-}" = "--test-analyst" ]; then
+  _real_log="$LOG"
+  _testdir=$(mktemp -d /tmp/mac-watchdog-test.XXXXXX)
+  for _f in incidents.log hypotheses.tsv tools.tsv tool-attempts.log events.log watchdog.conf reasoning.py blueprint.md; do
+    [ -f "$WATCHDOG_DIR/$_f" ] && cp -p "$WATCHDOG_DIR/$_f" "$_testdir/$_f" 2>/dev/null
+  done
+  [ -x "$WATCHDOG_DIR/recovery-agent" ] && cp -p "$WATCHDOG_DIR/recovery-agent" "$_testdir/recovery-agent" 2>/dev/null
+  [ -d "$WATCHDOG_DIR/tools" ] && cp -Rp "$WATCHDOG_DIR/tools" "$_testdir/tools" 2>/dev/null
+  WATCHDOG_DIR="$_testdir"
+  LOG="$WATCHDOG_DIR/watcher.log"
+  INCIDENTS="$WATCHDOG_DIR/incidents.log"
+  EVENTS="$WATCHDOG_DIR/events.log"
+  TOOLS="$WATCHDOG_DIR/tools.tsv"
+  ATTEMPTS="$WATCHDOG_DIR/tool-attempts.log"
+  HYPOTHESES="$WATCHDOG_DIR/hypotheses.tsv"
+  BLUEPRINT="$WATCHDOG_DIR/blueprint.md"
+  AGENT="$WATCHDOG_DIR/recovery-agent"
   SYMPTOMS="${2:-dns}"
   case "$SYMPTOMS" in
     *tailscale*) REFLEX_LOG="tailscale-up (test)"; RAN_TOOLS="tailscale-up" ;;
@@ -762,7 +850,9 @@ if [ "${1:-}" = "--test-analyst" ]; then
   echo "TEST-ANALYST: invoking the analyst on prepared data (symptoms=$SYMPTOMS, outcome=${3:-FIXED-BY-REFLEX})" >> "$LOG"
   call_analyst "${3:-FIXED-BY-REFLEX}" "$SYMPTOMS"
   python3 "$WATCHDOG_DIR/reasoning.py" 2>/dev/null
-  echo "TEST-ANALYST: done. See incidents.log and hypotheses.tsv." >> "$LOG"
+  echo "TEST-ANALYST: done. Test data in $_testdir (real files untouched)." >> "$LOG"
+  echo "TEST-ANALYST: done. Test data in $_testdir (real files untouched)." >> "$_real_log"
+  echo "TEST-ANALYST: done. Test data in $_testdir (real files untouched)."
   exit 0
 fi
 

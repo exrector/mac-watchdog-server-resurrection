@@ -40,6 +40,13 @@ mkdir -p "$WATCHDOG_DIR" 2>/dev/null
 # would make the loop see one long name instead of many files and the
 # restore would silently do nothing. Always use "${FILES[@]}".
 FILES=(watcher.sh blueprint.md recovery-agent reasoning.py click-allow.sh call-home.sh call-home-loop.sh watchdog.conf observer.sh review.sh lib/get-secret.sh scripts/setup-secrets.sh)
+# Memory files: the system's accumulated experience (incident history,
+# hypothesis table, tool registry and per-attempt log). They are NOT
+# code, so they are not in PROTECTED and stay writable. Without them a
+# wipe restores the executables but loses everything the system learned
+# — its memory, statistics and priorities. The backup step below keeps
+# the backup copies current, so a restore brings back the latest state.
+MEMORY_FILES=(incidents.log hypotheses.tsv tools.tsv tool-attempts.log)
 # Source files get the user-immutable flag after restore (logs and the
 # config stay writable so the user can edit the config and the Watcher
 # can write logs).
@@ -62,6 +69,25 @@ for f in "${FILES[@]}"; do
     else
       echo "$(date '+%Y-%m-%d %H:%M:%S') MISSING $f (no backup copy)" >> "$LOG"
     fi
+  fi
+done
+
+# Memory files: keep the backup current, then restore if missing.
+# The backup is refreshed whenever the live copy is newer (or the
+# backup is missing), so a wipe restores the latest learned state, not
+# an install-time snapshot. A one-time backup at install would be
+# stale within a day; this runs every 5 minutes with the bootstrap.
+mkdir -p "$BACKUP_DIR" 2>/dev/null
+for f in "${MEMORY_FILES[@]}"; do
+  if [ -f "$WATCHDOG_DIR/$f" ]; then
+    if [ ! -f "$BACKUP_DIR/$f" ] || [ "$WATCHDOG_DIR/$f" -nt "$BACKUP_DIR/$f" ]; then
+      cp -p "$WATCHDOG_DIR/$f" "$BACKUP_DIR/$f" 2>/dev/null
+    fi
+  fi
+  if [ ! -e "$WATCHDOG_DIR/$f" ] && [ -e "$BACKUP_DIR/$f" ]; then
+    cp -p "$BACKUP_DIR/$f" "$WATCHDOG_DIR/$f" 2>/dev/null
+    echo "$(date '+%Y-%m-%d %H:%M:%S') RESTORED $f from backup" >> "$LOG"
+    restored=1
   fi
 done
 

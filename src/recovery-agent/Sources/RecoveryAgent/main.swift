@@ -79,7 +79,16 @@ enum RecoveryAgent {
                 if case .toolCalls(let values) = entry { return total + values.count }
                 return total
             }
-            print("ANSWER=\(response.content)")
+            // Protocol: the ANSWER= marker goes on its OWN line, then
+            // the content follows unprefixed. If the marker were glued
+            // to the first content line ("ANSWER=<first line>"), a
+            // model answer starting with TOOL-EVAL: or HYPOTHESIS:
+            // would become "ANSWER=TOOL-EVAL:..." and the Watcher's
+            // grep for "^TOOL-EVAL:" / "^HYPOTHESIS:" would miss it —
+            // the first structured line would be lost. The marker line
+            // itself is skipped by the parsers (tail -n +2).
+            print("ANSWER=")
+            print(response.content)
             // NOTE: token counts are omitted for SDK compatibility.
             // `response.usage` exists only in newer Foundation Models SDKs
             // (macOS 27 / Xcode 27); older SDKs (macOS 26 runners) do not

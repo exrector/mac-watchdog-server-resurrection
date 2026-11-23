@@ -32,6 +32,8 @@ fi
 LOG="$WATCHDOG_DIR/review.log"
 INCIDENTS="$WATCHDOG_DIR/incidents.log"
 EVENTS="$WATCHDOG_DIR/events.log"
+TOOLS="$WATCHDOG_DIR/tools.tsv"
+ATTEMPTS="$WATCHDOG_DIR/tool-attempts.log"
 PROPOSALS="$WATCHDOG_DIR/proposals.md"
 AGENT="$WATCHDOG_DIR/recovery-agent"
 BLUEPRINT="$WATCHDOG_DIR/blueprint.md"
@@ -49,8 +51,29 @@ events=""
 if [ -f "$EVENTS" ]; then
   events=$(tail -n 60 "$EVENTS" 2>/dev/null)
 fi
+# Tool statistics: the reviewer must see how the repair tools actually
+# perform, or it cannot judge whether a fix helps. Without tools.tsv
+# and the per-attempt log it would propose changes blind to the
+# evidence about which tools work.
+tools=""
+if [ -f "$TOOLS" ]; then
+  tools=$(cat "$TOOLS" 2>/dev/null)
+fi
+attempts=""
+if [ -f "$ATTEMPTS" ]; then
+  attempts=$(tail -n 40 "$ATTEMPTS" 2>/dev/null)
+fi
+# The blueprint's Self-improvement section, embedded in the prompt.
+# The model runs in `ask` mode with NO file tools, so telling it to
+# "read $BLUEPRINT" is an unreachable instruction — it cannot open the
+# file. The section's text must be passed to it directly.
+blueprint_section=""
+if [ -f "$BLUEPRINT" ]; then
+  blueprint_section=$(awk '/^#.*Self-improvement/,/^# [^S]/' "$BLUEPRINT" 2>/dev/null | head -n 60)
+  [ -z "$blueprint_section" ] && blueprint_section=$(grep -A 30 "Self-improvement" "$BLUEPRINT" 2>/dev/null | head -n 40)
+fi
 
-prompt="You are this Mac's self-improvement reviewer. You have NO terminal and cannot run commands — analyse only. Read the blueprint's Self-improvement section in $BLUEPRINT. Incident history (newest last): $history. Recent state events (newest last): $events. Look for patterns: a problem that recurs, a reflex that fires often, a fix that only treats symptoms, a hypothesis that turned out wrong. Propose up to 3 concrete improvements. Each proposal must say: what to change, why, what it is expected to achieve, and how to verify it (a concrete check). If nothing is worth changing, say so plainly — do not invent work. Finish with ANSWER= followed by the proposals, one per line, or 'NO CHANGE NEEDED'."
+prompt="You are this Mac's self-improvement reviewer. You have NO terminal and cannot run commands — analyse only. The blueprint's Self-improvement section says: $blueprint_section. Incident history (newest last): $history. Recent state events (newest last): $events. Tool registry (id, name, state, runs, successes, total_seconds, incident_types): $tools. Recent tool attempts (newest last): $attempts. Look for patterns: a problem that recurs, a reflex that fires often, a fix that only treats symptoms, a hypothesis that turned out wrong, a tool that keeps failing or one that should be preferred. Propose up to 3 concrete improvements. Each proposal must say: what to change, why, what it is expected to achieve, and how to verify it (a concrete check). If nothing is worth changing, say so plainly — do not invent work. Finish with ANSWER= followed by the proposals, one per line, or 'NO CHANGE NEEDED'."
 echo "--- review model call ---" >> "$LOG"
 
 # Reuse run_to from watcher.sh if available; otherwise a simple call.
@@ -78,7 +101,7 @@ cat "$out" >> "$LOG"
 {
   echo "## $(date '+%Y-%m-%d %H:%M:%S') Daily review"
   echo ""
-  grep -A 20 "^ANSWER=" "$out" 2>/dev/null | sed 's/^ANSWER=//'
+  grep -A 20 "^ANSWER=" "$out" 2>/dev/null | tail -n +2
   echo ""
 } >> "$PROPOSALS"
 rm -f "$out"

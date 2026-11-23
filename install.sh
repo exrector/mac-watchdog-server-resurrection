@@ -188,6 +188,13 @@ cp "$SRC_DIR/scripts/setup-secrets.sh" "$BACKUP_DIR/scripts/setup-secrets.sh"
 # in the watchdog dir and the backup for reference.
 cp "$SRC_DIR/watchdog-bootstrap.sh" "$SUPPORT_DIR/watchdog-bootstrap.sh"
 cp "$SRC_DIR/watchdog-bootstrap.sh" "$BACKUP_DIR/watchdog-bootstrap.sh"
+# The bootstrap finds its config at $WATCHDOG_DIR/watchdog.conf, and
+# its default WATCHDOG_DIR is $HOME/watchdog. For a custom --dir
+# install that default is wrong: the config lives in the install dir,
+# so the bootstrap would never find it and would restore to the wrong
+# place. Patch the default in the installed copies to the real dir.
+_wd_esc=$(sed_escape "$INSTALL_DIR")
+sed -i '' "s|^WATCHDOG_DIR=\"\$HOME/watchdog\"|WATCHDOG_DIR=\"$_wd_esc\"|" "$SUPPORT_DIR/watchdog-bootstrap.sh" "$BACKUP_DIR/watchdog-bootstrap.sh" 2>/dev/null
 chmod +x "$INSTALL_DIR"/*.sh "$INSTALL_DIR"/lib/*.sh "$INSTALL_DIR"/scripts/*.sh "$INSTALL_DIR/recovery-agent" "$SUPPORT_DIR/watchdog-bootstrap.sh" 2>/dev/null
 chmod +x "$BACKUP_DIR"/*.sh "$BACKUP_DIR"/lib/*.sh "$BACKUP_DIR"/scripts/*.sh "$BACKUP_DIR/recovery-agent" 2>/dev/null
 echo "Files copied to $INSTALL_DIR and to the backup dir."

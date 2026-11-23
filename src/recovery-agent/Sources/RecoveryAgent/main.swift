@@ -22,8 +22,15 @@ struct TerminalTool: Tool {
         process.standardError = output
         do {
             try process.run()
+            // Read the pipe BEFORE waiting for exit. If waitUntilExit()
+            // runs first and the child writes more than the pipe buffer
+            // (~64 KB), the child blocks on the full pipe while we block
+            // waiting for it to exit — a deadlock. readDataToEndOfFile()
+            // blocks until EOF, which happens when the child exits and
+            // closes the pipe, so reading first is safe and avoids it.
+            let data = output.fileHandleForReading.readDataToEndOfFile()
             process.waitUntilExit()
-            var text = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            var text = String(data: data, encoding: .utf8) ?? ""
             if text.count > 2_500 { text = String(text.prefix(2_500)) + "\n[truncated]" }
             let result = "exit=\(process.terminationStatus)\n\(text)"
             fputs("RESULT> \(result.prefix(500))\n", stderr)

@@ -30,15 +30,10 @@ MODEL_TIMEOUT="${MODEL_TIMEOUT:-240}"
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"
 LOG_MAX_LINES="${LOG_MAX_LINES:-2000}"
 
-# Required: fail with a clear error naming the variable.
-require_var() {
-  local name="$1" value="$2"
-  if [ -z "$value" ]; then
-    echo "watchdog.conf: required variable $name is not set. Edit $CONF." >&2
-    exit 1
-  fi
-}
-require_var TAILSCALE_HOSTNAME "$TAILSCALE_HOSTNAME"
+# Tailscale is optional: if TAILSCALE_HOSTNAME is empty, the Tailscale
+# check is skipped (the machine is used without Tailscale). It used to be
+# required, which made the Watcher unusable without Tailscale.
+# (require_var TAILSCALE_HOSTNAME removed — see verify_health.)
 
 export WATCHDOG_DIR
 LOG="$WATCHDOG_DIR/watcher.log"
@@ -94,15 +89,22 @@ run_to() {
 }
 
 # Deterministic health verification. Prints one VERIFY line per item.
-# Returns 0 only if all 5 are OK.
+# Returns 0 only if all enabled checks are OK. A check is skipped when
+# its config is empty: Wi-Fi is skipped when WIFI_INTERFACE is empty
+# (Ethernet-only Mac), Tailscale is skipped when TAILSCALE_HOSTNAME is
+# empty (no Tailscale). A skipped check is not a failure.
 verify_health() {
   local ok=1
   local wifi ping dns route ts
-  wifi=$(run_to 10 networksetup -getairportpower "$WIFI_INTERFACE" 2>&1)
-  if echo "$wifi" | grep -q "On"; then
-    echo "VERIFY wifi OK: $wifi" >> "$LOG"
+  if [ -n "${WIFI_INTERFACE:-}" ]; then
+    wifi=$(run_to 10 networksetup -getairportpower "$WIFI_INTERFACE" 2>&1)
+    if echo "$wifi" | grep -q "On"; then
+      echo "VERIFY wifi OK: $wifi" >> "$LOG"
+    else
+      echo "VERIFY wifi BROKEN: $wifi" >> "$LOG"; ok=0
+    fi
   else
-    echo "VERIFY wifi BROKEN: $wifi" >> "$LOG"; ok=0
+    echo "VERIFY wifi SKIP (no WIFI_INTERFACE configured)" >> "$LOG"
   fi
   ping=$(run_to 10 ping -c1 -q -W 2000 "$PING_TARGET" 2>&1)
   if echo "$ping" | grep -q "1 packets received"; then
@@ -130,16 +132,43 @@ verify_health() {
       echo "VERIFY route BROKEN: $route" >> "$LOG"; ok=0
     fi
   fi
-  ts=$(run_to 15 "$TAILSCALE_CLI" status 2>&1 | head -1)
-  if echo "$ts" | grep -q "$TAILSCALE_HOSTNAME" && ! echo "$ts" | grep -Eqi "offline|stopped"; then
-    echo "VERIFY tailscale OK: $ts" >> "$LOG"
+  if [ -n "${TAILSCALE_HOSTNAME:-}" ]; then
+    ts=$(run_to 15 "$TAILSCALE_CLI" status 2>&1 | head -1)
+    if echo "$ts" | grep -q "$TAILSCALE_HOSTNAME" && ! echo "$ts" | grep -Eqi "offline|stopped"; then
+      echo "VERIFY tailscale OK: $ts" >> "$LOG"
+    else
+      echo "VERIFY tailscale BROKEN: $ts" >> "$LOG"; ok=0
+    fi
   else
-    echo "VERIFY tailscale BROKEN: $ts" >> "$LOG"; ok=0
+    echo "VERIFY tailscale SKIP (no TAILSCALE_HOSTNAME configured)" >> "$LOG"
   fi
   return $((1 - ok))
 }
 
 PROMPT="Read $BLUEPRINT and check this Mac against it, item by item, in order. Check each item ONCE. Do not re-run a Check that already returned Good. For each item report one line: OK or BROKEN with the exact command output that proves it. Repair only the BROKEN items using the Repairs section, then re-run ONLY that item's Check. Finish with ANSWER= followed by one line per item."
+
+# Dry run: check only, change nothing. Runs the deterministic health
+# check, prints the result, and exits without waking the model.
+if [ "${1:-}" = "--dry-run" ]; then
+  if verify_health; then
+    echo "DRY-RUN: HEALTHY — no repair needed, model would not be woken."
+    exit 0
+  else
+    echo "DRY-RUN: BROKEN — the model would be woken to repair it. See VERIFY lines above."
+    exit 1
+  fi
+fi
+
+# Pre-check: if the machine is already healthy, do nothing. The model
+# is only woken when the deterministic check finds something broken.
+# Without this, the model would run on every tick even when nothing
+# is wrong (wasted time and context on a healthy machine).
+if verify_health; then
+  echo "HEALTHY, no repair needed" >> "$LOG"
+  echo "=== $(date '+%Y-%m-%d %H:%M:%S') DONE ===" >> "$LOG"
+  python3 "$WATCHDOG_DIR/reasoning.py" 2>/dev/null
+  exit 0
+fi
 
 attempt=1
 while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do

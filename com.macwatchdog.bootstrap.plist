@@ -7,15 +7,15 @@
   <key>ProgramArguments</key>
   <array>
     <string>/bin/zsh</string>
-    <string>__WATCHDOG_DIR__/watchdog-bootstrap.sh</string>
+    <string>__SUPPORT_DIR__/watchdog-bootstrap.sh</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
   <key>StartInterval</key>
-  <integer>300</integer>
+  <integer>__CHECK_INTERVAL__</integer>
   <key>StandardOutPath</key>
-  <string>__WATCHDOG_DIR__/bootstrap.log</string>
+  <string>__SUPPORT_DIR__/bootstrap.launchd.log</string>
   <key>StandardErrorPath</key>
-  <string>__WATCHDOG_DIR__/bootstrap.log</string>
+  <string>__SUPPORT_DIR__/bootstrap.launchd.log</string>
 </dict>
 </plist>

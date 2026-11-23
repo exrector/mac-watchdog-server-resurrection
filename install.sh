@@ -3,11 +3,18 @@
 #
 # Usage:
 #   ./install.sh [--dir /path/to/install] [--no-secrets] [--no-agents]
+#                [--with-call-home]
 #
 # Default install dir is ~/watchdog. The script is idempotent: re-running
 # it is safe. It will NOT overwrite an existing watchdog.conf or a
 # secrets store without asking, and it re-applies the chflags uchg
 # protection after copying (removing the flag first so the copy succeeds).
+#
+# The permanent call-home tunnel agent is NOT installed by default. By
+# default, the Watcher opens a one-shot outbound tunnel only when it
+# gives up after 3 failed repair attempts. Pass --with-call-home to also
+# install a permanent tunnel agent (KeepAlive) that keeps the machine
+# reachable at all times. See README.md, "Plan B".
 #
 # This repo contains NO binaries. recovery-agent is built from the Swift
 # source in src/recovery-agent/ on this machine (swift build -c release,
@@ -28,16 +35,19 @@
 set -u
 SRC_DIR="${0:A:h}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/watchdog}"
+SUPPORT_DIR="$HOME/Library/Application Support/MacWatchdog"
 DO_SECRETS=1
 DO_AGENTS=1
+DO_CALL_HOME=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --dir) INSTALL_DIR="$2"; shift 2 ;;
     --no-secrets) DO_SECRETS=0; shift ;;
     --no-agents) DO_AGENTS=0; shift ;;
+    --with-call-home) DO_CALL_HOME=1; shift ;;
     -h|--help)
-      echo "usage: $0 [--dir /path/to/install] [--no-secrets] [--no-agents]"
+      echo "usage: $0 [--dir /path/to/install] [--no-secrets] [--no-agents] [--with-call-home]"
       exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
@@ -136,8 +146,12 @@ fi
 echo
 
 # --- 2. Directories ---
-BACKUP_DIR="$HOME/Library/Application Support/MacWatchdog/backup"
-mkdir -p "$INSTALL_DIR" "$BACKUP_DIR" "$INSTALL_DIR/lib" "$INSTALL_DIR/scripts" "$BACKUP_DIR/lib" "$BACKUP_DIR/scripts" "$BACKUP_DIR/launchagents" 2>/dev/null
+# BACKUP_DIR lives under SUPPORT_DIR (outside the watchdog dir), so a
+# wipe of ~/watchdog/ cannot take the backup with it. The bootstrap
+# script itself also lives in SUPPORT_DIR for the same reason (see
+# watchdog-bootstrap.sh) — the LaunchAgent runs that copy.
+BACKUP_DIR="$SUPPORT_DIR/backup"
+mkdir -p "$INSTALL_DIR" "$BACKUP_DIR" "$INSTALL_DIR/lib" "$INSTALL_DIR/scripts" "$BACKUP_DIR/lib" "$BACKUP_DIR/scripts" "$BACKUP_DIR/launchagents" "$SUPPORT_DIR" 2>/dev/null
 
 # Remove the immutable flag from existing files so the copy can overwrite
 # them (re-applied at the end). Ignore errors (files may not exist yet).
@@ -156,7 +170,12 @@ cp "$SRC_DIR/lib/get-secret.sh" "$INSTALL_DIR/lib/get-secret.sh"
 cp "$SRC_DIR/lib/get-secret.sh" "$BACKUP_DIR/lib/get-secret.sh"
 cp "$SRC_DIR/scripts/setup-secrets.sh" "$INSTALL_DIR/scripts/setup-secrets.sh"
 cp "$SRC_DIR/scripts/setup-secrets.sh" "$BACKUP_DIR/scripts/setup-secrets.sh"
-chmod +x "$INSTALL_DIR"/*.sh "$INSTALL_DIR"/lib/*.sh "$INSTALL_DIR"/scripts/*.sh "$INSTALL_DIR/recovery-agent" 2>/dev/null
+# The bootstrap script lives in SUPPORT_DIR (outside the watchdog dir)
+# so it survives a wipe of the watchdog dir itself. A copy also stays
+# in the watchdog dir and the backup for reference.
+cp "$SRC_DIR/watchdog-bootstrap.sh" "$SUPPORT_DIR/watchdog-bootstrap.sh"
+cp "$SRC_DIR/watchdog-bootstrap.sh" "$BACKUP_DIR/watchdog-bootstrap.sh"
+chmod +x "$INSTALL_DIR"/*.sh "$INSTALL_DIR"/lib/*.sh "$INSTALL_DIR"/scripts/*.sh "$INSTALL_DIR/recovery-agent" "$SUPPORT_DIR/watchdog-bootstrap.sh" 2>/dev/null
 chmod +x "$BACKUP_DIR"/*.sh "$BACKUP_DIR"/lib/*.sh "$BACKUP_DIR"/scripts/*.sh "$BACKUP_DIR/recovery-agent" 2>/dev/null
 echo "Files copied to $INSTALL_DIR and to the backup dir."
 
@@ -220,23 +239,38 @@ else
 fi
 
 # --- 6. Protect the source files (NOT the config, NOT the logs) ---
-# chflags uchg = user immutable: the files cannot be deleted or modified,
-# not even by the model (which has a terminal and sudo). Logs stay writable.
+# chflags uchg = user immutable: the files resist accidental deletion or
+# modification, including by the model (which has a terminal and sudo).
+# This is a speed bump, not a guarantee: the owner or root can remove
+# the flag with `chflags nouchg`. Logs stay writable.
 for d in "$INSTALL_DIR" "$BACKUP_DIR"; do
   chflags uchg "$d/watcher.sh" "$d/blueprint.md" "$d/recovery-agent" "$d/reasoning.py" "$d/click-allow.sh" "$d/call-home.sh" "$d/call-home-loop.sh" "$d/watchdog-bootstrap.sh" "$d/lib/get-secret.sh" "$d/scripts/setup-secrets.sh" 2>/dev/null || true
 done
+chflags uchg "$SUPPORT_DIR/watchdog-bootstrap.sh" 2>/dev/null || true
 echo "Source files marked chflags uchg (immutable). Config and logs stay writable."
 echo "To update a source file later: chflags nouchg <file>, edit, chflags uchg <file>."
 
 # --- 7. LaunchAgents ---
+# The watcher and bootstrap agents always install. The call-home agent
+# (permanent outbound tunnel) installs only with --with-call-home; by
+# default the Watcher opens a one-shot tunnel only when it gives up.
 if [ "$DO_AGENTS" -eq 1 ]; then
   mkdir -p "$HOME/Library/LaunchAgents"
   _uid=$(id -u)
-  for p in watcher bootstrap call-home; do
+  _ci="${CHECK_INTERVAL:-300}"
+  _wd_esc=$(sed_escape "$WATCHDOG_DIR")
+  _sup_esc=$(sed_escape "$SUPPORT_DIR")
+  _agents="watcher bootstrap"
+  if [ "$DO_CALL_HOME" -eq 1 ]; then
+    _agents="$_agents call-home"
+  fi
+  for p in $_agents; do
     _tmpl="$SRC_DIR/com.macwatchdog.$p.plist"
     _dst="$HOME/Library/LaunchAgents/com.macwatchdog.$p.plist"
-    _wd_esc=$(sed_escape "$WATCHDOG_DIR")
-    sed "s|__WATCHDOG_DIR__|$_wd_esc|g" "$_tmpl" > "$_dst"
+    sed -e "s|__WATCHDOG_DIR__|$_wd_esc|g" \
+        -e "s|__SUPPORT_DIR__|$_sup_esc|g" \
+        -e "s|__CHECK_INTERVAL__|$_ci|g" \
+        "$_tmpl" > "$_dst"
     cp "$_dst" "$BACKUP_DIR/launchagents/com.macwatchdog.$p.plist"
     _out=$(launchctl bootstrap "gui/$_uid" "$_dst" 2>&1) || true
     if echo "$_out" | grep -qi "already"; then
@@ -247,6 +281,9 @@ if [ "$DO_AGENTS" -eq 1 ]; then
       echo "LaunchAgent com.macwatchdog.$p: loaded."
     fi
   done
+  if [ "$DO_CALL_HOME" -eq 0 ]; then
+    echo "Call-home agent NOT installed (default). The Watcher still opens a one-shot tunnel when it gives up. Re-run with --with-call-home for a permanent tunnel."
+  fi
 else
   echo "Skipping LaunchAgent install (--no-agents)."
 fi

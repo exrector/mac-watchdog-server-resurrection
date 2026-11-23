@@ -1,0 +1,62 @@
+# CI: static checks for the watchdog scripts and config.
+#
+# This does NOT test the model (the runners have no Apple Intelligence)
+# and does NOT run the Watcher against a real Mac. It catches the class
+# of bug that broke installation before: a script that fails to parse,
+# a config the shell cannot source, or a helper the installer expects
+# but the repo does not contain.
+#
+# A real end-to-end test still needs a Mac: see README.md, "Testing it".
+
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: zsh syntax check (all scripts)
+        run: |
+          sudo apt-get install -y zsh
+          for f in install.sh uninstall.sh watcher.sh watchdog-bootstrap.sh \
+                   lib/get-secret.sh scripts/setup-secrets.sh \
+                   call-home.sh call-home-loop.sh click-allow.sh; do
+            zsh -n "$f" || { echo "SYNTAX FAIL: $f"; exit 1; }
+          done
+          echo "All zsh scripts parse."
+
+      - name: python syntax check
+        run: python3 -m py_compile reasoning.py
+
+      - name: config template is sourceable by zsh
+        run: |
+          zsh -c 'source watchdog.conf.example; echo "CHECK_INTERVAL=$CHECK_INTERVAL"'
+
+      - name: installer references only files that exist in the repo
+        run: |
+          # Every file install.sh copies must be committed (not gitignored).
+          # This is the check that would have caught the *secret* gitignore bug.
+          for f in watcher.sh blueprint.md reasoning.py click-allow.sh \
+                   call-home.sh call-home-loop.sh watchdog-bootstrap.sh \
+                   watchdog.conf.example lib/get-secret.sh \
+                   scripts/setup-secrets.sh; do
+            if ! git ls-files --error-unmatch "$f" >/dev/null 2>&1; then
+              echo "MISSING FROM REPO (but install.sh copies it): $f"
+              exit 1
+            fi
+          done
+          echo "All files the installer copies are committed."
+
+      - name: no absolute URLs or placeholders in README install steps
+        run: |
+          if grep -q '<you>' README.md; then
+            echo "README still contains a <you> placeholder URL."
+            exit 1
+          fi
+          echo "README URLs are concrete."

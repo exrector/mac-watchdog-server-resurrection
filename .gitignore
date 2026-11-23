@@ -3,8 +3,10 @@
 # and holds your hostnames and addresses.
 watchdog.conf
 # The secrets file (mode 600) and anything that looks like a secret.
+# NOTE: do NOT use `*secret*` here — it would also ignore the helper
+# scripts lib/get-secret.sh and scripts/setup-secrets.sh, which are
+# source code, not secrets. Those scripts must be committed.
 secrets
-*secret*
 *password*
 *authkey*
 *.pem

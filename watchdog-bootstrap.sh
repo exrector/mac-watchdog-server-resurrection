@@ -13,15 +13,21 @@
 # If the config itself is missing, built-in defaults are used (this script
 # must work even when the config is gone — that is its whole purpose).
 
-SCRIPT_DIR="${0:A:h}"
-CONF="$SCRIPT_DIR/watchdog.conf"
-WATCHDOG_DIR="$SCRIPT_DIR"
-BACKUP_DIR="$HOME/Library/Application Support/MacWatchdog/backup"
+# This script lives OUTSIDE the watchdog dir (in ~/Library/Application
+# Support/MacWatchdog/), so it survives a wipe of ~/watchdog/ itself.
+# A copy also lives in ~/watchdog/ for reference, but the LaunchAgent
+# runs the support-dir copy. The paths below are therefore fixed, not
+# derived from the script's own location — the script must work no
+# matter where it is run from.
+SUPPORT_DIR="$HOME/Library/Application Support/MacWatchdog"
+WATCHDOG_DIR="$HOME/watchdog"
+BACKUP_DIR="$SUPPORT_DIR/backup"
+CONF="$WATCHDOG_DIR/watchdog.conf"
 if [ -f "$CONF" ]; then
   # shellcheck disable=SC1090
   source "$CONF"
-  WATCHDOG_DIR="${WATCHDOG_DIR:-$SCRIPT_DIR}"
-  BACKUP_DIR="${BACKUP_DIR:-$HOME/Library/Application Support/MacWatchdog/backup}"
+  WATCHDOG_DIR="${WATCHDOG_DIR:-$HOME/watchdog}"
+  BACKUP_DIR="${BACKUP_DIR:-$SUPPORT_DIR/backup}"
 fi
 LOG="$WATCHDOG_DIR/bootstrap.log"
 mkdir -p "$WATCHDOG_DIR" 2>/dev/null
@@ -29,14 +35,18 @@ mkdir -p "$WATCHDOG_DIR" 2>/dev/null
 # Files restored to the watchdog dir. Secrets are NOT here: they live in
 # the macOS Keychain or in ~/.config/mac-watchdog/secrets (see
 # lib/get-secret.sh), outside the watchdog dir, so a wipe cannot take them.
-FILES="watcher.sh blueprint.md recovery-agent reasoning.py click-allow.sh call-home.sh call-home-loop.sh watchdog.conf lib/get-secret.sh scripts/setup-secrets.sh"
+# NOTE: these are zsh arrays, not strings. In zsh, `for f in $FILES`
+# does NOT split a string on whitespace (unlike bash), so a plain string
+# would make the loop see one long name instead of many files and the
+# restore would silently do nothing. Always use "${FILES[@]}".
+FILES=(watcher.sh blueprint.md recovery-agent reasoning.py click-allow.sh call-home.sh call-home-loop.sh watchdog.conf lib/get-secret.sh scripts/setup-secrets.sh)
 # Source files get the user-immutable flag after restore (logs and the
 # config stay writable so the user can edit the config and the Watcher
 # can write logs).
 PROTECTED="watcher.sh blueprint.md recovery-agent reasoning.py click-allow.sh call-home.sh call-home-loop.sh lib/get-secret.sh scripts/setup-secrets.sh"
 
 restored=0
-for f in $FILES; do
+for f in "${FILES[@]}"; do
   if [ ! -e "$WATCHDOG_DIR/$f" ]; then
     if [ -e "$BACKUP_DIR/$f" ]; then
       mkdir -p "$WATCHDOG_DIR/$(dirname "$f")" 2>/dev/null
@@ -59,8 +69,8 @@ done
 # load them (best effort). The bootstrap's own plist cannot reload itself
 # if it was removed — restoring the file is still useful; a reboot or a
 # manual `launchctl bootstrap` brings it back.
-PLISTS="com.macwatchdog.watcher.plist com.macwatchdog.bootstrap.plist com.macwatchdog.call-home.plist"
-for p in $PLISTS; do
+PLISTS=(com.macwatchdog.watcher.plist com.macwatchdog.bootstrap.plist com.macwatchdog.call-home.plist)
+for p in "${PLISTS[@]}"; do
   if [ ! -e "$HOME/Library/LaunchAgents/$p" ] && [ -e "$BACKUP_DIR/launchagents/$p" ]; then
     cp -p "$BACKUP_DIR/launchagents/$p" "$HOME/Library/LaunchAgents/$p" 2>/dev/null
     echo "$(date '+%Y-%m-%d %H:%M:%S') RESTORED $p to LaunchAgents" >> "$LOG"

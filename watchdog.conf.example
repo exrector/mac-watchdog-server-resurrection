@@ -23,12 +23,18 @@ CHECK_INTERVAL=300
 # Your node's hostname as shown in `tailscale status` (first line, 2nd field).
 # Example: if `tailscale status` shows "100.64.0.5  mac-mini  you@  macOS",
 # then TAILSCALE_HOSTNAME="mac-mini".
+# OPTIONAL: leave it empty ("") to skip the Tailscale check entirely
+# (the machine is used without Tailscale). The Watcher then never
+# checks or repairs Tailscale.
 TAILSCALE_HOSTNAME="mac-mini"
 
 # Path to the Tailscale CLI inside the GUI app bundle.
 TAILSCALE_CLI="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 
 # Wi-Fi interface name (usually en1 on Apple Silicon Macs, en0 on some).
+# OPTIONAL: leave it empty ("") to skip the Wi-Fi check (the Mac uses
+# Ethernet only and keeps Wi-Fi off). Otherwise the Watcher would
+# report Wi-Fi as BROKEN forever on an Ethernet-only machine.
 WIFI_INTERFACE="en1"
 
 # Ping target used to test internet connectivity.

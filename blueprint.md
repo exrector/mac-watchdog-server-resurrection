@@ -17,6 +17,12 @@ There is no separate good file. Do not look for good.md or good.txt.
 
 ## Health checklist — Check each item ONCE. Do not re-run a Check that already returned Good.
 
+Skip an item when it is not configured for this machine: skip item 1
+(Wi-Fi) when no Wi-Fi interface is configured (Ethernet-only Mac);
+skip item 5 (Tailscale) when no Tailscale hostname is configured
+(no Tailscale). A skipped item is not a failure — do not repair it
+and do not report it as broken.
+
 1. Wi-Fi power
    Check: networksetup -getairportpower <YOUR_WIFI_INTERFACE>
    Good: Wi-Fi Power (<YOUR_WIFI_INTERFACE>): On
